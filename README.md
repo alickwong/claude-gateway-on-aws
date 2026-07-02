@@ -1,10 +1,12 @@
 # Deploy Claude Apps Gateway on AWS
 
-> A worked example of running Claude apps gateway on AWS: EKS (or ECS Fargate), Amazon RDS for PostgreSQL, AWS Secrets Manager, and EKS Pod Identity auth to Amazon Bedrock.
-
 > **Note:** This page walks through one way to run Claude apps gateway on AWS. The configuration is a working example for customer-managed infrastructure rather than a supported production deployment; use it to see how the pieces fit together before adapting it to your own environment. For the platform-agnostic requirements, see the [deployment guide](https://code.claude.com/docs/en/claude-apps-gateway-deploy).
 
 This example provisions Claude apps gateway on AWS with Amazon Bedrock as the model upstream, using EKS for compute. Any OpenID Connect (OIDC) compliant IdP works for authentication; only the `oidc` block changes. See [Identity provider setup](https://code.claude.com/docs/en/claude-apps-gateway-deploy#identity-provider-setup) for per-IdP details.
+
+> **⚠️ The gateway URL must resolve to a private address.** At `/login`, Claude Code requires the gateway's hostname or IP to resolve **only** to private addresses: RFC 1918 (`10/8`, `172.16/12`, `192.168/16`), CGNAT (`100.64.0.0/10`), IPv6 ULA (`fc00::/7`), or loopback for local development. The check runs on *each* resolved IP — if the name resolves to **any** public address, `/login` rejects the URL. This is why the reference deployment uses an **internal** ALB.
+>
+> If developer machines route HTTPS through a corporate proxy, sign-in also requires the **proxy host** to resolve to private addresses. If it doesn't, add the gateway host to `NO_PROXY` so the CLI connects directly.
 
 ## What you'll build
 
@@ -562,9 +564,7 @@ kubectl apply -f ingress.yaml
 
 The gateway is now running. Set `forceLoginMethod` and `forceLoginGatewayUrl` in the [managed settings file](https://code.claude.com/docs/en/claude-apps-gateway#set-the-gateway-url) you deploy to each device via MDM. There is no gateway option in the login picker for a developer to select manually.
 
-> **⚠️ The gateway URL must resolve to a private address.** At `/login`, Claude Code requires the gateway's hostname or IP to resolve **only** to private addresses: RFC 1918 (`10/8`, `172.16/12`, `192.168/16`), CGNAT (`100.64.0.0/10`), IPv6 ULA (`fc00::/7`), or loopback for local development. The check runs on *each* resolved IP — if the name resolves to **any** public address, `/login` rejects the URL. This is why the reference deployment uses an **internal** ALB.
->
-> If developer machines route HTTPS through a corporate proxy, sign-in also requires the **proxy host** to resolve to private addresses. If it doesn't, add the gateway host to `NO_PROXY` so the CLI connects directly.
+> **Reminder:** The gateway URL must resolve only to private addresses, or Claude Code rejects it at `/login` — see the note at the top of this guide.
 
 ## Troubleshooting
 
