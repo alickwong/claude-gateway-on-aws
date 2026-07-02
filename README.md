@@ -305,7 +305,8 @@ kubectl create namespace claude-gateway
 kubectl create serviceaccount gateway -n claude-gateway
 
 # Associate the service account with the IAM role via EKS Pod Identity.
-# Requires the "Amazon EKS Pod Identity Agent" add-on on the cluster:
+# On EKS Auto Mode clusters the Pod Identity agent is built into the node —
+# nothing to install. On a standard cluster, add the agent first:
 #   aws eks create-addon --cluster-name "$CLUSTER_NAME" --addon-name eks-pod-identity-agent
 aws eks create-pod-identity-association \
   --cluster-name "$CLUSTER_NAME" \
