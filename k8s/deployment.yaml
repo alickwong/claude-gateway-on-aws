@@ -1,0 +1,75 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: claude-gateway
+  namespace: claude-gateway
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: claude-gateway
+  template:
+    metadata:
+      labels:
+        app: claude-gateway
+    spec:
+      serviceAccountName: gateway
+      containers:
+        - name: gateway
+          image: 331102492406.dkr.ecr.us-east-1.amazonaws.com/claude-gateway:2.1.196
+          ports:
+            - containerPort: 8080
+              protocol: TCP
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: 8080
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            initialDelaySeconds: 15
+            periodSeconds: 20
+          resources:
+            requests:
+              cpu: "500m"
+              memory: "512Mi"
+            limits:
+              cpu: "1000m"
+              memory: "1Gi"
+          volumeMounts:
+            - name: secrets
+              mountPath: /secrets
+              readOnly: true
+            - name: config
+              mountPath: /etc/claude
+              readOnly: true
+      volumes:
+        - name: secrets
+          csi:
+            driver: secrets-store.csi.k8s.io
+            readOnly: true
+            volumeAttributes:
+              secretProviderClass: claude-gateway-secrets
+        - name: config
+          csi:
+            driver: secrets-store.csi.k8s.io
+            readOnly: true
+            volumeAttributes:
+              secretProviderClass: claude-gateway-config
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: claude-gateway
+  namespace: claude-gateway
+spec:
+  type: ClusterIP
+  selector:
+    app: claude-gateway
+  ports:
+    - port: 8080
+      targetPort: 8080
+      protocol: TCP

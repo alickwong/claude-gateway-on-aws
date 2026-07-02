@@ -1,0 +1,31 @@
+listen:
+  host: 0.0.0.0
+  port: 8080
+  public_url: https://<YOUR_DOMAIN>
+  trusted_proxies: [<YOUR_VPC_CIDR>]
+
+oidc:
+  issuer: https://accounts.google.com
+  client_id: <YOUR_GOOGLE_OAUTH_CLIENT_ID>
+  client_secret: ${file:/secrets/oidc-client-secret}
+  allowed_email_domains: [<YOUR_EMAIL_DOMAIN>]
+  scopes: [openid, profile, email]
+  extra_auth_params: { access_type: offline, prompt: consent }
+
+session:
+  jwt_secret: ${file:/secrets/jwt-secret}
+
+store:
+  postgres_url: ${file:/secrets/postgres-url}
+
+admin:
+  read_keys:
+    - { id: reporting, key: "${file:/secrets/admin-read-key}" }
+  write_keys:
+    - { id: admin, key: "${file:/secrets/admin-write-key}" }
+  admin_groups: [<YOUR_ADMIN_EMAIL>]
+
+upstreams:
+  - provider: bedrock
+    region: <YOUR_AWS_REGION>
+    auth: {}
