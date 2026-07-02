@@ -117,19 +117,36 @@ GATEWAY_POSTGRES_URL="postgres://gateway:${PGPASS}@${RDS_ENDPOINT}:5432/claude_g
 
 Create an IAM role with Bedrock permissions. This role will be assumed by the EKS pod via IRSA:
 
+> **Important — inference profiles:** Claude Code invokes models through Bedrock **inference profiles** (e.g. `au.anthropic.claude-opus-4-6-v1`, `global.anthropic.claude-opus-4-8`), not bare foundation-model IDs. When you invoke via an inference profile, Bedrock authorizes the request against **both** the `inference-profile/*` ARN **and** the underlying `foundation-model/*` ARNs in every region the profile can route to. A policy that only grants `foundation-model/anthropic.*` will fail with `403 ... is not authorized to perform: bedrock:InvokeModelWithResponseStream on resource: arn:aws:bedrock:<region>:<account>:inference-profile/...`. You must grant both resource types.
+
 ```bash
-# Create the IAM policy for Bedrock access
-cat > /tmp/bedrock-policy.json << 'EOF'
+# Create the IAM policy for Bedrock access.
+# NOTE: covers foundation models AND inference profiles (required for
+# cross-region / geo inference profiles like au.* and global.*).
+cat > /tmp/bedrock-policy.json << EOF
 {
   "Version": "2012-10-17",
   "Statement": [
     {
+      "Sid": "InvokeFoundationModels",
       "Effect": "Allow",
       "Action": [
         "bedrock:InvokeModel",
         "bedrock:InvokeModelWithResponseStream"
       ],
       "Resource": "arn:aws:bedrock:*::foundation-model/anthropic.*"
+    },
+    {
+      "Sid": "InvokeInferenceProfiles",
+      "Effect": "Allow",
+      "Action": [
+        "bedrock:InvokeModel",
+        "bedrock:InvokeModelWithResponseStream"
+      ],
+      "Resource": [
+        "arn:aws:bedrock:*:${AWS_ACCOUNT_ID}:inference-profile/*",
+        "arn:aws:bedrock:*:${AWS_ACCOUNT_ID}:application-inference-profile/*"
+      ]
     }
   ]
 }

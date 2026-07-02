@@ -29,3 +29,86 @@ upstreams:
   - provider: bedrock
     region: <YOUR_AWS_REGION>
     auth: {}
+
+# Model mappings: client-facing `id` -> Bedrock inference-profile `upstream_model`.
+# The `bedrock:` value MUST be a valid inference profile ID for your region.
+# Verify with:
+#   aws bedrock list-inference-profiles --region <YOUR_AWS_REGION> \
+#     | jq -r '.inferenceProfileSummaries[] | select(.inferenceProfileId | test("anthropic")) | .inferenceProfileId'
+# NOTE: profile suffixes are NOT uniform (e.g. opus-4-6 has -v1, opus-4-7/4-8 do not,
+# sonnet-4-5/haiku-4-5 use dated -20250929-v1:0 style). Do not assume a pattern.
+# The examples below use `au.*` (Australia / ap-southeast-2). Swap the prefix
+# (us.* / apac.* / global.*) to match your region's available profiles.
+auto_include_builtin_models: true
+models:
+  - id: claude-opus-4-6
+    label: Claude Opus 4.6
+    upstream_model:
+      bedrock: au.anthropic.claude-opus-4-6-v1
+  - id: global.anthropic.claude-opus-4-6-v1
+    label: Claude Opus 4.6 (global)
+    upstream_model:
+      bedrock: au.anthropic.claude-opus-4-6-v1
+  - id: claude-opus-4-7
+    label: Claude Opus 4.7
+    upstream_model:
+      bedrock: au.anthropic.claude-opus-4-7
+  - id: global.anthropic.claude-opus-4-7
+    label: Claude Opus 4.7 (global)
+    upstream_model:
+      bedrock: au.anthropic.claude-opus-4-7
+  - id: claude-opus-4-8
+    label: Claude Opus 4.8
+    upstream_model:
+      bedrock: au.anthropic.claude-opus-4-8
+  - id: global.anthropic.claude-opus-4-8
+    label: Claude Opus 4.8 (global)
+    upstream_model:
+      bedrock: au.anthropic.claude-opus-4-8
+  - id: claude-sonnet-4-5
+    label: Claude Sonnet 4.5
+    upstream_model:
+      bedrock: au.anthropic.claude-sonnet-4-5-20250929-v1:0
+  - id: claude-sonnet-4-6
+    label: Claude Sonnet 4.6
+    upstream_model:
+      bedrock: au.anthropic.claude-sonnet-4-6
+  - id: global.anthropic.claude-sonnet-4-6
+    label: Claude Sonnet 4.6 (global)
+    upstream_model:
+      bedrock: au.anthropic.claude-sonnet-4-6
+  - id: claude-haiku-4-5
+    label: Claude Haiku 4.5
+    upstream_model:
+      bedrock: au.anthropic.claude-haiku-4-5-20251001-v1:0
+  - id: global.anthropic.claude-haiku-4-5-20251001-v1:0
+    label: Claude Haiku 4.5 (global)
+    upstream_model:
+      bedrock: au.anthropic.claude-haiku-4-5-20251001-v1:0
+  # Bare bedrock-profile-id aliases: a client may send the raw profile id via
+  # `/model` or ANTHROPIC_MODEL. Without these, the gateway rejects it with
+  # "model X is not in the operator's model allowlist". Keep one alias per profile.
+  - id: au.anthropic.claude-opus-4-6-v1
+    label: Claude Opus 4.6 (au)
+    upstream_model:
+      bedrock: au.anthropic.claude-opus-4-6-v1
+  - id: au.anthropic.claude-opus-4-7
+    label: Claude Opus 4.7 (au)
+    upstream_model:
+      bedrock: au.anthropic.claude-opus-4-7
+  - id: au.anthropic.claude-opus-4-8
+    label: Claude Opus 4.8 (au)
+    upstream_model:
+      bedrock: au.anthropic.claude-opus-4-8
+  - id: au.anthropic.claude-sonnet-4-5-20250929-v1:0
+    label: Claude Sonnet 4.5 (au)
+    upstream_model:
+      bedrock: au.anthropic.claude-sonnet-4-5-20250929-v1:0
+  - id: au.anthropic.claude-sonnet-4-6
+    label: Claude Sonnet 4.6 (au)
+    upstream_model:
+      bedrock: au.anthropic.claude-sonnet-4-6
+  - id: au.anthropic.claude-haiku-4-5-20251001-v1:0
+    label: Claude Haiku 4.5 (au)
+    upstream_model:
+      bedrock: au.anthropic.claude-haiku-4-5-20251001-v1:0
