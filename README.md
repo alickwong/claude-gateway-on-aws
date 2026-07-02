@@ -1,6 +1,6 @@
 # Deploy Claude Apps Gateway on AWS
 
-> A worked example of running Claude apps gateway on AWS: EKS (or ECS Fargate), Amazon RDS for PostgreSQL, AWS Secrets Manager, and IAM Roles for Service Accounts (IRSA) auth to Amazon Bedrock.
+> A worked example of running Claude apps gateway on AWS: EKS (or ECS Fargate), Amazon RDS for PostgreSQL, AWS Secrets Manager, and EKS Pod Identity auth to Amazon Bedrock.
 
 > **Note:** This page walks through one way to run Claude apps gateway on AWS. The configuration is a working example for customer-managed infrastructure rather than a supported production deployment; use it to see how the pieces fit together before adapting it to your own environment. For the platform-agnostic requirements, see the [deployment guide](https://code.claude.com/docs/en/claude-apps-gateway-deploy).
 
@@ -14,8 +14,45 @@ The reference configuration provisions:
 * **Amazon ECR** repository for the gateway image
 * **Amazon RDS for PostgreSQL** instance, private subnets only, for the gateway's [store](https://code.claude.com/docs/en/claude-apps-gateway-config#store)
 * **AWS Secrets Manager** secrets for `gateway.yaml`, the JWT signing key, the OIDC client secret, and the Postgres URL
-* **IAM Role** with `bedrock:InvokeModel*` permissions, bound via IRSA on EKS (or task role on ECS)
+* **IAM Role** with `bedrock:InvokeModel*` and Secrets Manager read permissions, bound via EKS Pod Identity (or task role on ECS)
 * **Internal Application Load Balancer (ALB)** for HTTPS termination
+
+## Architecture
+
+```mermaid
+flowchart TB
+    dev["Developer machine<br/>(Claude Code)"]
+
+    subgraph aws["AWS account · ap-southeast-2 (VPC)"]
+        alb["Internal ALB<br/>HTTPS 443 · ACM cert"]
+
+        subgraph eks["Amazon EKS (Auto Mode)"]
+            direction TB
+            sa["ServiceAccount: gateway<br/>Pod Identity association"]
+            pod["claude-gateway pod<br/>container :8080<br/>/readyz · /healthz"]
+            csi["Secrets Store CSI driver<br/>mounts /secrets + /etc/claude"]
+            sa -.binds.- pod
+            csi -->|volume mount| pod
+        end
+
+        sm["AWS Secrets Manager<br/>claude-gateway/*<br/>config · jwt · oidc · postgres-url<br/>admin-read/write keys"]
+        rds[("Amazon RDS PostgreSQL 16<br/>claude_gateway<br/>private subnets only")]
+        iam["IAM role<br/>claude-gateway-pod-identity-role<br/>bedrock-invoke + secrets-manager-read"]
+        bedrock["Amazon Bedrock<br/>Claude inference profiles"]
+    end
+
+    idp["OIDC IdP<br/>(Google / Okta / Azure AD)"]
+
+    dev -->|HTTPS| alb
+    alb -->|:8080| pod
+    pod -->|OIDC login| idp
+    pod -->|token usage / spend| rds
+    csi -->|GetSecretValue| sm
+    pod -->|assumes / IAM creds| iam
+    iam -->|InvokeModel*| bedrock
+```
+
+> Auth flows via **EKS Pod Identity**: the `gateway` ServiceAccount is associated with `claude-gateway-pod-identity-role`, which grants Bedrock invocation and Secrets Manager reads. Everything except the developer's inbound HTTPS and the OIDC redirect stays inside the VPC.
 
 ## Prerequisites
 
