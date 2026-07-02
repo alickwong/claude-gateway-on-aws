@@ -6,14 +6,15 @@ metadata:
   annotations:
     alb.ingress.kubernetes.io/target-type: ip
     alb.ingress.kubernetes.io/listen-ports: '[{"HTTPS":443}]'
-    alb.ingress.kubernetes.io/certificate-arn: arn:aws:acm:us-east-1:331102492406:certificate/a0f3e213-fdb9-4f3e-a570-1984bc7e4505
+    alb.ingress.kubernetes.io/certificate-arn: arn:aws:acm:ap-southeast-2:331102492406:certificate/44d60f23-245b-428a-b07b-3bc81a8ff02c
     alb.ingress.kubernetes.io/ssl-policy: ELBSecurityPolicy-TLS13-1-2-2021-06
     alb.ingress.kubernetes.io/healthcheck-path: /readyz
     alb.ingress.kubernetes.io/target-group-attributes: deregistration_delay.timeout_seconds=30
     alb.ingress.kubernetes.io/load-balancer-attributes: idle_timeout.timeout_seconds=3600
-    alb.ingress.kubernetes.io/subnets: subnet-03e8054d3a8223843,subnet-0b0709127d12d70bc
+    alb.ingress.kubernetes.io/scheme: internal
+    alb.ingress.kubernetes.io/subnets: subnet-0beb6d0c8f104f389,subnet-0a326e6c4f8dcb84c
 spec:
-  ingressClassName: alb-internal
+  ingressClassName: alb
   rules:
     - http:
         paths:

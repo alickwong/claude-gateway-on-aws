@@ -31,7 +31,7 @@ Set the account and region once:
 
 ```bash
 export AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
-export AWS_REGION=us-east-1   # a region where the Claude models you need are available in Bedrock
+export AWS_REGION=ap-southeast-2   # a region where the Claude models you need are available in Bedrock
 export VPC_ID=<your-vpc-id>
 export PRIVATE_SUBNET_IDS=<subnet-1-id>,<subnet-2-id>   # private subnets for RDS and EKS
 export CLUSTER_NAME=claude-gateway-cluster
@@ -115,7 +115,7 @@ GATEWAY_POSTGRES_URL="postgres://gateway:${PGPASS}@${RDS_ENDPOINT}:5432/claude_g
 
 ### Step 3: Create the IAM role for the gateway
 
-Create an IAM role with Bedrock permissions. This role will be assumed by the EKS pod via IRSA:
+Create an IAM role the gateway pod assumes to (1) invoke Bedrock models and (2) let the Secrets Store CSI driver read the gateway's secrets. This guide uses **EKS Pod Identity** (the current recommended mechanism); see the note at the end of this step for the IRSA alternative.
 
 > **Important — inference profiles:** Claude Code invokes models through Bedrock **inference profiles** (e.g. `au.anthropic.claude-opus-4-6-v1`, `global.anthropic.claude-opus-4-8`), not bare foundation-model IDs. When you invoke via an inference profile, Bedrock authorizes the request against **both** the `inference-profile/*` ARN **and** the underlying `foundation-model/*` ARNs in every region the profile can route to. A policy that only grants `foundation-model/anthropic.*` will fail with `403 ... is not authorized to perform: bedrock:InvokeModelWithResponseStream on resource: arn:aws:bedrock:<region>:<account>:inference-profile/...`. You must grant both resource types.
 
@@ -158,40 +158,68 @@ aws iam create-policy \
 
 BEDROCK_POLICY_ARN="arn:aws:iam::${AWS_ACCOUNT_ID}:policy/claude-gateway-bedrock-access"
 
-# Get the OIDC provider for your EKS cluster
-OIDC_PROVIDER=$(aws eks describe-cluster --name "$CLUSTER_NAME" \
-  --query "cluster.identity.oidc.issuer" --output text | sed 's|https://||')
+# Policy allowing the Secrets Store CSI driver to read the gateway's secrets.
+# Without this the pod's secret/config volumes fail to mount.
+cat > /tmp/secrets-policy.json << EOF
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": [
+        "secretsmanager:GetSecretValue",
+        "secretsmanager:DescribeSecret"
+      ],
+      "Resource": "arn:aws:secretsmanager:${AWS_REGION}:${AWS_ACCOUNT_ID}:secret:claude-gateway/*"
+    }
+  ]
+}
+EOF
 
-# Create trust policy for IRSA
+aws iam create-policy \
+  --policy-name claude-gateway-secrets-access \
+  --policy-document file:///tmp/secrets-policy.json
+
+SECRETS_POLICY_ARN="arn:aws:iam::${AWS_ACCOUNT_ID}:policy/claude-gateway-secrets-access"
+
+# Trust policy for EKS Pod Identity — the pod identity agent assumes this role.
 cat > /tmp/trust-policy.json << EOF
 {
   "Version": "2012-10-17",
   "Statement": [
     {
       "Effect": "Allow",
-      "Principal": {
-        "Federated": "arn:aws:iam::${AWS_ACCOUNT_ID}:oidc-provider/${OIDC_PROVIDER}"
-      },
-      "Action": "sts:AssumeRoleWithWebIdentity",
-      "Condition": {
-        "StringEquals": {
-          "${OIDC_PROVIDER}:sub": "system:serviceaccount:claude-gateway:gateway",
-          "${OIDC_PROVIDER}:aud": "sts.amazonaws.com"
-        }
-      }
+      "Principal": { "Service": "pods.eks.amazonaws.com" },
+      "Action": ["sts:AssumeRole", "sts:TagSession"]
     }
   ]
 }
 EOF
 
 aws iam create-role \
-  --role-name claude-gateway-role \
+  --role-name claude-gateway-pod-identity-role \
   --assume-role-policy-document file:///tmp/trust-policy.json
 
 aws iam attach-role-policy \
-  --role-name claude-gateway-role \
+  --role-name claude-gateway-pod-identity-role \
   --policy-arn "$BEDROCK_POLICY_ARN"
+
+aws iam attach-role-policy \
+  --role-name claude-gateway-pod-identity-role \
+  --policy-arn "$SECRETS_POLICY_ARN"
 ```
+
+> **IRSA alternative:** If you prefer IAM Roles for Service Accounts instead of Pod Identity, use this trust policy on the role instead of the one above (requires an IAM OIDC provider on the cluster), and skip the `create-pod-identity-association` in Step 6a:
+>
+> ```bash
+> OIDC_PROVIDER=$(aws eks describe-cluster --name "$CLUSTER_NAME" \
+>   --query "cluster.identity.oidc.issuer" --output text | sed 's|https://||')
+> # Principal: { "Federated": "arn:aws:iam::${AWS_ACCOUNT_ID}:oidc-provider/${OIDC_PROVIDER}" }
+> # Action: "sts:AssumeRoleWithWebIdentity"
+> # Condition StringEquals:
+> #   "${OIDC_PROVIDER}:sub": "system:serviceaccount:claude-gateway:gateway"
+> #   "${OIDC_PROVIDER}:aud": "sts.amazonaws.com"
+> ```
 
 ### Step 4: Store secrets in AWS Secrets Manager
 
@@ -212,6 +240,14 @@ aws secretsmanager create-secret \
   --name claude-gateway/postgres-url \
   --secret-string "$GATEWAY_POSTGRES_URL"
 
+# Admin API keys — read-only (reporting) and read-write (admin)
+aws secretsmanager create-secret \
+  --name claude-gateway/admin-read-key \
+  --secret-string "$(openssl rand -base64 32)"
+aws secretsmanager create-secret \
+  --name claude-gateway/admin-write-key \
+  --secret-string "$(openssl rand -base64 32)"
+
 # Full gateway.yaml config (created in next step)
 aws secretsmanager create-secret \
   --name claude-gateway/config \
@@ -220,7 +256,7 @@ aws secretsmanager create-secret \
 
 ### Step 5: Write gateway.yaml
 
-The `upstreams` block points at Amazon Bedrock with `auth: {}`, so the gateway authenticates via the IRSA-provided credentials. See the [configuration reference](https://code.claude.com/docs/en/claude-apps-gateway-config) for every field.
+The `upstreams` block points at Amazon Bedrock with `auth: {}`, so the gateway authenticates via the pod's IAM credentials (Pod Identity or IRSA). See the [configuration reference](https://code.claude.com/docs/en/claude-apps-gateway-config) for every field.
 
 ```yaml
 # gateway.yaml — Google Workspace example
@@ -244,10 +280,17 @@ session:
 store:
   postgres_url: ${file:/secrets/postgres-url}
 
+admin:
+  read_keys:
+    - { id: reporting, key: "${file:/secrets/admin-read-key}" }
+  write_keys:
+    - { id: admin, key: "${file:/secrets/admin-write-key}" }
+  admin_groups: [<your-admin-email-or-group>]
+
 upstreams:
   - provider: bedrock
-    region: us-east-1              # must match $AWS_REGION
-    auth: {}                       # uses IRSA credentials from the pod's service account
+    region: ap-southeast-2         # must match $AWS_REGION
+    auth: {}                       # uses the pod's IAM credentials (Pod Identity / IRSA)
 ```
 
 > **Note:** Adjust the `oidc` block for your identity provider. The example shows Google Workspace. For Azure AD, use `issuer: https://login.microsoftonline.com/<tenant-id>/v2.0` and add `offline_access` to `scopes` instead of `extra_auth_params`. For Okta, use `issuer: https://<your-org>.okta.com`. The `extra_auth_params` field passes additional parameters to the authorization endpoint — Google requires `access_type: offline` to issue refresh tokens.
@@ -261,9 +304,21 @@ kubectl create namespace claude-gateway
 
 kubectl create serviceaccount gateway -n claude-gateway
 
-kubectl annotate serviceaccount gateway -n claude-gateway \
-  eks.amazonaws.com/role-arn="arn:aws:iam::${AWS_ACCOUNT_ID}:role/claude-gateway-role"
+# Associate the service account with the IAM role via EKS Pod Identity.
+# Requires the "Amazon EKS Pod Identity Agent" add-on on the cluster:
+#   aws eks create-addon --cluster-name "$CLUSTER_NAME" --addon-name eks-pod-identity-agent
+aws eks create-pod-identity-association \
+  --cluster-name "$CLUSTER_NAME" \
+  --namespace claude-gateway \
+  --service-account gateway \
+  --role-arn "arn:aws:iam::${AWS_ACCOUNT_ID}:role/claude-gateway-pod-identity-role"
 ```
+
+> **Using IRSA instead?** Skip the association above and annotate the service account with the role ARN:
+> ```bash
+> kubectl annotate serviceaccount gateway -n claude-gateway \
+>   eks.amazonaws.com/role-arn="arn:aws:iam::${AWS_ACCOUNT_ID}:role/claude-gateway-pod-identity-role"
+> ```
 
 #### 6b. Install the AWS Secrets Manager CSI driver
 
@@ -302,6 +357,12 @@ spec:
       - objectName: "claude-gateway/postgres-url"
         objectType: "secretsmanager"
         objectAlias: "postgres-url"
+      - objectName: "claude-gateway/admin-read-key"
+        objectType: "secretsmanager"
+        objectAlias: "admin-read-key"
+      - objectName: "claude-gateway/admin-write-key"
+        objectType: "secretsmanager"
+        objectAlias: "admin-write-key"
 ---
 apiVersion: secrets-store.csi.x-k8s.io/v1
 kind: SecretProviderClass
@@ -331,7 +392,7 @@ metadata:
   name: claude-gateway
   namespace: claude-gateway
 spec:
-  replicas: 2
+  replicas: 1
   selector:
     matchLabels:
       app: claude-gateway
@@ -436,9 +497,10 @@ metadata:
     alb.ingress.kubernetes.io/healthcheck-path: /readyz
     alb.ingress.kubernetes.io/target-group-attributes: deregistration_delay.timeout_seconds=30
     alb.ingress.kubernetes.io/load-balancer-attributes: idle_timeout.timeout_seconds=3600
+    alb.ingress.kubernetes.io/scheme: internal   # internal-only ALB (no public IP)
     alb.ingress.kubernetes.io/subnets: <subnet-1-id>,<subnet-2-id>
 spec:
-  ingressClassName: alb-internal    # use your internal ALB IngressClass name
+  ingressClassName: alb
   rules:
     - host: claude-gateway.internal.example.com
       http:
