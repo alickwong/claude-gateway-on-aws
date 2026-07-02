@@ -562,6 +562,10 @@ kubectl apply -f ingress.yaml
 
 The gateway is now running. Set `forceLoginMethod` and `forceLoginGatewayUrl` in the [managed settings file](https://code.claude.com/docs/en/claude-apps-gateway#set-the-gateway-url) you deploy to each device via MDM. There is no gateway option in the login picker for a developer to select manually.
 
+> **⚠️ The gateway URL must resolve to a private address.** At `/login`, Claude Code requires the gateway's hostname or IP to resolve **only** to private addresses: RFC 1918 (`10/8`, `172.16/12`, `192.168/16`), CGNAT (`100.64.0.0/10`), IPv6 ULA (`fc00::/7`), or loopback for local development. The check runs on *each* resolved IP — if the name resolves to **any** public address, `/login` rejects the URL. This is why the reference deployment uses an **internal** ALB.
+>
+> If developer machines route HTTPS through a corporate proxy, sign-in also requires the **proxy host** to resolve to private addresses. If it doesn't, add the gateway host to `NO_PROXY` so the CLI connects directly.
+
 ## Troubleshooting
 
 | Symptom | Cause | Fix |
