@@ -16,7 +16,7 @@ spec:
       serviceAccountName: gateway
       containers:
         - name: gateway
-          image: 331102492406.dkr.ecr.us-east-1.amazonaws.com/claude-gateway:2.1.196
+          image: 331102492406.dkr.ecr.ap-southeast-2.amazonaws.com/claude-gateway:2.1.196
           ports:
             - containerPort: 8080
               protocol: TCP
