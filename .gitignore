@@ -2,3 +2,9 @@ gateway.yaml
 admin-dashboard/
 build/
 .DS_Store
+
+# Terraform
+**/.terraform/*
+*.tfstate
+*.tfstate.*
+.terraform.lock.hcl

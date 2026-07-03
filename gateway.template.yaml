@@ -25,6 +25,24 @@ admin:
     - { id: admin, key: "${file:/secrets/admin-write-key}" }
   admin_groups: [<YOUR_ADMIN_EMAIL>]
 
+# Client telemetry: direct-send to a standalone OTEL collector.
+# Rather than relaying via the gateway (telemetry.forward_to), we push OTEL_*
+# env vars to every client through managed settings so the CLI sends OTLP
+# straight to the collector's internal ALB. The CLI still stamps user.id /
+# user.email / user.groups from its gateway JWT, so attribution is preserved.
+# Delivering these env vars triggers the CLI's one-time managed-settings
+# approval dialog on each client.
+managed:
+  policies:
+    - match: {}
+      cli:
+        env:
+          CLAUDE_CODE_ENABLE_TELEMETRY: "1"
+          OTEL_METRICS_EXPORTER: otlp
+          OTEL_EXPORTER_OTLP_PROTOCOL: http/protobuf
+          OTEL_EXPORTER_OTLP_ENDPOINT: https://<YOUR_OTEL_COLLECTOR_HOST>
+          OTEL_EXPORTER_OTLP_HEADERS: "Authorization=Bearer ${file:/secrets/otel-bearer-token}"
+
 upstreams:
   - provider: bedrock
     region: <YOUR_AWS_REGION>
