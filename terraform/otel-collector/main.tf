@@ -152,6 +152,66 @@ resource "aws_eks_pod_identity_association" "collector" {
   role_arn        = aws_iam_role.collector.arn
 }
 
+# ---------------------------------------------------------------------------
+# CloudWatch dashboard for Claude Code usage metrics (namespace: ClaudeCode).
+# Metrics are emitted per user.email; queries use CloudWatch Metrics Insights.
+# ---------------------------------------------------------------------------
+resource "aws_cloudwatch_dashboard" "claude_code_usage" {
+  dashboard_name = "ClaudeCodeUsage"
+  dashboard_body = jsonencode({
+    widgets = [
+      {
+        type   = "metric"
+        x      = 0
+        y      = 0
+        width  = 12
+        height = 6
+        properties = {
+          metrics = [[{
+            expression = "SEARCH('{ClaudeCode,user.email} MetricName=claude_code.token.usage', 'Sum', 300)"
+            id         = "e2"
+            period     = 300
+            region     = var.region
+            label      = "$${PROP('Dim.user.email')}"
+          }]]
+          view    = "timeSeries"
+          stacked = false
+          region  = var.region
+          stat    = "Sum"
+          period  = 300
+          title   = "Token Usage Per User (5 min, sum)"
+          legend  = { position = "bottom" }
+          yAxis   = { left = { showUnits = true } }
+        }
+      },
+      {
+        type   = "metric"
+        x      = 12
+        y      = 0
+        width  = 12
+        height = 6
+        properties = {
+          metrics = [[{
+            expression = "SEARCH('{ClaudeCode,user.email} MetricName=claude_code.cost.usage', 'Sum', 3600)"
+            id         = "e3"
+            period     = 3600
+            region     = var.region
+            label      = "$${PROP('Dim.user.email')}"
+          }]]
+          view    = "timeSeries"
+          stacked = false
+          region  = var.region
+          stat    = "Sum"
+          period  = 3600
+          title   = "Cost Per User (1 hour, sum)"
+          legend  = { position = "bottom" }
+          yAxis   = { left = { showUnits = true, label = "USD" } }
+        }
+      },
+    ]
+  })
+}
+
 output "collector_role_arn" {
   value = aws_iam_role.collector.arn
 }

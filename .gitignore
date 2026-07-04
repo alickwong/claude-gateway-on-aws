@@ -12,8 +12,8 @@ k8s/otel-collector.yaml
 k8s/deployment.yaml
 k8s/ingress.yaml
 
-# Local operational notes with real IPs/account IDs (keep out of the public repo).
-docs/otel-e2e-verification.md
+# Local docs & operational notes (real IPs/account IDs, specs — keep out of the public repo).
+docs/
 
 # Terraform
 # Provider/module cache
