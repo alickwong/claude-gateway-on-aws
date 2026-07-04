@@ -194,7 +194,40 @@ Point your gateway hostname at the ALB's **private** IP (private Route 53 alias
 or `/etc/hosts`), then browse `https://<gateway-host>/` — the OIDC login should
 start.
 
-## Step 6 (optional) — Usage telemetry
+## Step 6 — Point Claude Code at the gateway
+
+Configure each developer's Claude Code to log in through the gateway with a
+**managed settings** file. This forces the gateway login method and pins the
+gateway URL, so users can't accidentally bypass it. Create
+`managed-settings.json`:
+
+```json
+{
+  "forceLoginMethod": "gateway",
+  "forceLoginGatewayUrl": "https://<gateway-host>"
+}
+```
+
+Replace `<gateway-host>` with your gateway's hostname (the same one covered by
+the ACM cert and resolving to the ALB's private IP). Place the file at the
+OS-specific managed-settings path — these are read-only, enterprise-managed
+locations that take precedence over user settings:
+
+| OS | Path |
+| --- | --- |
+| macOS | `/Library/Application Support/ClaudeCode/managed-settings.json` |
+| Linux / WSL | `/etc/claude-code/managed-settings.json` |
+| Windows | `C:\ProgramData\ClaudeCode\managed-settings.json` |
+
+For fleet-wide rollout, distribute this file via your MDM/configuration
+management (Jamf, Intune, Ansible, etc.) rather than by hand.
+
+With that in place, `claude /login` sends users straight to the gateway's OIDC
+flow. Because the gateway URL must resolve to a private address (see the warning
+above), developers must be on the VPC network (VPN or private DNS) for login to
+succeed.
+
+## Step 7 (optional) — Usage telemetry
 
 Follow [README-OTEL.md](./README-OTEL.md) to add per-user token metrics in
 CloudWatch.
