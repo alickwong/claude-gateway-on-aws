@@ -566,6 +566,13 @@ The gateway is now running. Set `forceLoginMethod` and `forceLoginGatewayUrl` in
 
 > **Reminder:** The gateway URL must resolve only to private addresses, or Claude Code rejects it at `/login` — see the note at the top of this guide.
 
+### Step 8 (optional): Add usage telemetry
+
+To capture per-user token usage in CloudWatch, deploy the OpenTelemetry
+collector described in **[README-OTEL.md](./README-OTEL.md)**. Clients send OTLP
+directly to a standalone collector behind an internal ALB; the gateway pushes
+the client `OTEL_*` configuration via a managed policy.
+
 ## Troubleshooting
 
 | Symptom | Cause | Fix |
