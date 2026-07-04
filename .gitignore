@@ -3,6 +3,9 @@ admin-dashboard/
 build/
 .DS_Store
 
+# Local Claude Code harness state (settings, worktrees, locks).
+.claude/
+
 # Deployment values & rendered manifests (contain account IDs / ARNs / subnets).
 # Commit the *.template.yaml + deploy.env.example instead.
 deploy.env
