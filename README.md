@@ -13,14 +13,31 @@ Kubernetes manifests. End to end is ~25 minutes, most of it EKS + RDS creation.
 
 For usage telemetry, see [README-OTEL.md](./README-OTEL.md).
 
-```
-Terraform  ──▶  EKS (Auto Mode) · RDS · ECR · IAM (Pod Identity) · Secrets Manager
-   │                                   (VPC referenced read-only, never destroyed)
-   ▼
-docker build/push  ──▶  ECR
-   ▼
-kubectl apply      ──▶  namespace · CSI driver · SecretProviderClasses ·
-                        Deployment · internal ALB Ingress
+```mermaid
+flowchart TB
+    tf["<b>terraform apply</b>"]
+    tf --> eks["EKS cluster<br/>(Auto Mode)"]
+    tf --> rds[("RDS<br/>PostgreSQL")]
+    tf --> ecr["ECR<br/>repository"]
+    tf --> iam["IAM role<br/>(Pod Identity)"]
+    tf --> sm["Secrets Manager<br/>jwt · admin · postgres-url<br/>+ config / oidc placeholders"]
+
+    build["<b>docker build / push</b>"] --> ecr
+
+    kubectl["<b>kubectl apply</b>"]
+    kubectl --> ns["namespace + ServiceAccount"]
+    kubectl --> csi["Secrets Store CSI driver<br/>+ SecretProviderClasses"]
+    kubectl --> workload["Deployment + internal ALB Ingress"]
+
+    ecr -.image.-> workload
+    sm -.mounted via CSI.-> workload
+    vpc["Existing VPC<br/>(referenced read-only,<br/>never created or destroyed)"] -.-> eks
+    vpc -.-> rds
+
+    classDef step fill:#e8f0fe,stroke:#4285f4,stroke-width:2px;
+    classDef ext fill:#f5f5f5,stroke:#9aa0a6,stroke-dasharray:4 3;
+    class tf,build,kubectl step;
+    class vpc ext;
 ```
 
 ## Prerequisites
