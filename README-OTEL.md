@@ -334,6 +334,17 @@ aws cloudwatch list-metrics --region "$AWS_REGION" --namespace ClaudeCode \
 
 ## Viewing metrics
 
+### Default dashboard
+
+The Terraform in [`terraform/otel-collector`](./terraform/otel-collector) creates
+a CloudWatch dashboard named **`ClaudeCodeUsage`** with two per-user widgets out
+of the box — **Token Usage Per User** (5-minute sum) and **Cost Per User**
+(1-hour sum). Open it under **CloudWatch → Dashboards → `ClaudeCodeUsage`**.
+
+![ClaudeCodeUsage CloudWatch dashboard: per-user token usage and cost](./images/cloudwatch.png)
+
+### Ad-hoc queries
+
 Console: **CloudWatch → Metrics → All metrics → Custom namespaces →
 `ClaudeCode`** → pick a dimension set → select `claude_code.token.usage` → set
 the statistic to **Sum**.
