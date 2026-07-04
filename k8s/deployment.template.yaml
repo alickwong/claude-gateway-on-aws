@@ -1,3 +1,7 @@
+# TEMPLATE — render with your values, do not deploy directly:
+#   set -a && . ./deploy.env && set +a
+#   envsubst < k8s/deployment.template.yaml | kubectl apply -f -
+# See deploy.env.example for the variables.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -14,9 +18,19 @@ spec:
         app: claude-gateway
     spec:
       serviceAccountName: gateway
+      # Resolve the collector's ALB hostname to an ALB private IP so the gateway's
+      # telemetry.forward_to relay (https://${OTEL_HOST}) reaches the internal
+      # ALB. The ALB terminates TLS with your ACM cert, so we must connect by
+      # hostname (not IP) for TLS to validate. Mirrors the /etc/hosts pattern.
+      # NOTE: internal ALB IPs can change if the ALB is recreated — update this entry
+      # (or move to a private Route53 alias) if the collector ingress is rebuilt.
+      hostAliases:
+        - ip: "${ALB_PRIVATE_IP}"
+          hostnames:
+            - ${OTEL_HOST}
       containers:
         - name: gateway
-          image: 331102492406.dkr.ecr.ap-southeast-2.amazonaws.com/claude-gateway:2.1.196
+          image: ${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/claude-gateway:${GATEWAY_IMAGE_TAG}
           ports:
             - containerPort: 8080
               protocol: TCP

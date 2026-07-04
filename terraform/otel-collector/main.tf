@@ -19,7 +19,7 @@ variable "region" {
 
 variable "cluster_name" {
   type    = string
-  default = "claude-gateway-sydney"
+  default = "claude-gateway"
 }
 
 variable "namespace" {

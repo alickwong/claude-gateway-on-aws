@@ -1,3 +1,7 @@
+# TEMPLATE — render with your values, do not deploy directly:
+#   set -a && . ./deploy.env && set +a
+#   envsubst < k8s/ingress.template.yaml | kubectl apply -f -
+# See deploy.env.example for the variables.
 apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
@@ -6,13 +10,13 @@ metadata:
   annotations:
     alb.ingress.kubernetes.io/target-type: ip
     alb.ingress.kubernetes.io/listen-ports: '[{"HTTPS":443}]'
-    alb.ingress.kubernetes.io/certificate-arn: arn:aws:acm:ap-southeast-2:331102492406:certificate/44d60f23-245b-428a-b07b-3bc81a8ff02c
+    alb.ingress.kubernetes.io/certificate-arn: ${ACM_CERT_ARN}
     alb.ingress.kubernetes.io/ssl-policy: ELBSecurityPolicy-TLS13-1-2-2021-06
     alb.ingress.kubernetes.io/healthcheck-path: /readyz
     alb.ingress.kubernetes.io/target-group-attributes: deregistration_delay.timeout_seconds=30
     alb.ingress.kubernetes.io/load-balancer-attributes: idle_timeout.timeout_seconds=3600
     alb.ingress.kubernetes.io/scheme: internal
-    alb.ingress.kubernetes.io/subnets: subnet-0beb6d0c8f104f389,subnet-0a326e6c4f8dcb84c
+    alb.ingress.kubernetes.io/subnets: ${ALB_SUBNETS}
 spec:
   ingressClassName: alb
   rules:

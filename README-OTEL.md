@@ -12,32 +12,49 @@ developer-side configuration.
 ## What you'll build
 
 ```
-                    managed-settings.json (pushed by the gateway per user)
-                    sets OTEL_* env vars on each client
-                              │
-   Claude Code CLI  ──────────┼──────── OTLP/HTTPS ─────────▶  Internal ALB
-   stamps user.id /           │         (TLS + Bearer)          otel.<your-domain>
-   user.email from the        │                                 (ACM cert)
-   gateway JWT                │                                      │
-                              │                                      ▼
-                                                          OTEL Collector (Deployment)
-                                                          bearertokenauth validates
-                                                                    │
-                                                        ┌───────────┴───────────┐
-                                                        ▼                       ▼
-                                                  awsemf (EMF)          otlphttp + sigv4
-                                                  CloudWatch metrics    CloudWatch
-                                                  namespace: ClaudeCode
+   Claude Code CLI              gateway auto-pushes OTEL_* env vars via
+   stamps user.id /             /managed/settings (endpoint = public_url)
+   user.email from the                        │
+   gateway JWT                                ▼
+        │                             ┌─────────────────┐
+        └──────── OTLP/HTTPS ────────▶│  Claude Gateway │  telemetry.forward_to
+                  (to public_url)     │    (relay)      │  relays verbatim +
+                                      └────────┬────────┘  adds Bearer header
+                                               │ OTLP/HTTPS (TLS + Bearer)
+                                               ▼
+                                          Internal ALB  otel.<your-domain>
+                                          (ACM cert; gateway resolves it to
+                                           the ALB private IP via hostAliases)
+                                               │
+                                               ▼
+                                     OTEL Collector (Deployment)
+                                     bearertokenauth validates
+                                               │
+                                        ┌──────┴──────┐
+                                        ▼             ▼
+                                   awsemf (EMF)  otlphttp + sigv4
+                                   CloudWatch    CloudWatch
+                                   namespace: ClaudeCode
 ```
 
-**Design choice — direct-send, not relay.** The gateway *can* relay telemetry
-itself (`telemetry.forward_to`), but that couples every client's metrics to the
-gateway process. Instead, this guide has the gateway **push `OTEL_*` env vars to
-clients via a managed policy**, so each CLI sends OTLP **directly** to a
-standalone collector. The CLI still stamps `user.id` / `user.email` /
-`user.groups` from its gateway-issued JWT, so per-user attribution is preserved
-either way. See [`docs/superpowers/specs/2026-07-03-otel-collector-direct-send-design.md`](./docs/superpowers/specs/2026-07-03-otel-collector-direct-send-design.md)
-for the full rationale.
+**Design choice — gateway relay (`telemetry.forward_to`).** This is the
+documented, first-class telemetry path: the CLI sends OTLP **to the gateway**
+(endpoint built from `listen.public_url`), and the gateway **relays it verbatim**
+to the collector. The CLI still stamps `user.id` / `user.email` / `user.groups`
+from its gateway-issued JWT, so per-user attribution is preserved. Relay means
+**clients need zero OTEL configuration** — no `/etc/hosts`, no bearer token —
+because the gateway auto-pushes the `OTEL_*` env vars and holds the token
+server-side.
+
+> **History:** an earlier revision of this guide used client **direct-send**
+> (push `OTEL_EXPORTER_OTLP_ENDPOINT=<collector ALB>` to clients via a
+> `managed.policies` env block). That endpoint is **not on the CLI safe list**
+> and direct-send proved unreliable in practice — the CLI never POSTed to the
+> ALB. The relay below replaces it. See
+> [`docs/otel-e2e-verification.md`](./docs/otel-e2e-verification.md) for the
+> end-to-end debugging and evidence, and
+> [`docs/superpowers/specs/2026-07-03-otel-collector-direct-send-design.md`](./docs/superpowers/specs/2026-07-03-otel-collector-direct-send-design.md)
+> for the original (superseded) direct-send rationale.
 
 ## Prerequisites
 
@@ -52,9 +69,9 @@ for the full rationale.
 Set these shell variables — every step below uses them:
 
 ```bash
-export AWS_REGION=ap-southeast-2
+export AWS_REGION=us-east-1                            # your cluster's region
 export AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
-export CLUSTER_NAME=claude-gateway-sydney
+export CLUSTER_NAME=claude-gateway                     # your EKS cluster name
 export OTEL_HOST=otel.example.com                     # collector hostname (must match the ACM cert)
 export ACM_CERT_ARN=arn:aws:acm:${AWS_REGION}:${AWS_ACCOUNT_ID}:certificate/<your-cert-id>
 export ALB_SUBNETS=subnet-aaaa,subnet-bbbb            # same private subnets as the gateway ingress
@@ -107,33 +124,63 @@ CloudWatch — the role must trust both). Its policy grants:
 
 ## Step 3: Deploy the collector
 
-The manifest [`k8s/otel-collector.yaml`](./k8s/otel-collector.yaml) contains the
-ServiceAccount, SecretProviderClass, ConfigMap (collector pipeline), Deployment,
-Service, and the internal ALB Ingress.
+The manifest [`k8s/otel-collector.template.yaml`](./k8s/otel-collector.template.yaml)
+contains the ServiceAccount, SecretProviderClass, ConfigMap (collector pipeline),
+Deployment, Service, and the internal ALB Ingress. It is a **template**: account-
+specific values are `${VARIABLES}` you supply via a `deploy.env` file, so nothing
+account-specific is committed.
 
-**Before applying, replace the reference values** with your own. The committed
-file is pinned to the reference deployment (account `331102492406`, region
-`ap-southeast-2`, a specific cert ARN, subnets, and `otel.alickwong.com`):
-
-| Location in `k8s/otel-collector.yaml` | Replace with |
-| --- | --- |
-| SA annotation `eks.amazonaws.com/role-arn` | your `collector_role_arn` from Step 2 |
-| ConfigMap `sigv4auth.region`, `awsemf.region`, `otlphttp.endpoint` | your `$AWS_REGION` |
-| ConfigMap `resource.aws.account_id` value | your `$AWS_ACCOUNT_ID` |
-| Ingress `certificate-arn` | your `$ACM_CERT_ARN` |
-| Ingress `subnets` | your `$ALB_SUBNETS` |
-| Ingress `rules[].host` | your `$OTEL_HOST` |
-
-A quick `sed` for the common ones (review the diff before applying):
+**Create your `deploy.env`** from the example and fill in your values:
 
 ```bash
-sed -e "s/331102492406/${AWS_ACCOUNT_ID}/g" \
-    -e "s/ap-southeast-2/${AWS_REGION}/g" \
-    -e "s#certificate/44d60f23-245b-428a-b07b-3bc81a8ff02c#certificate/<your-cert-id>#g" \
-    -e "s/subnet-0beb6d0c8f104f389,subnet-0a326e6c4f8dcb84c/${ALB_SUBNETS}/g" \
-    -e "s/otel.alickwong.com/${OTEL_HOST}/g" \
-    k8s/otel-collector.yaml | kubectl apply -f -
+cp deploy.env.example deploy.env
+$EDITOR deploy.env      # set AWS_ACCOUNT_ID, AWS_REGION, OTEL_HOST, ACM_CERT_ARN,
+                        # ALB_SUBNETS, ALB_LOGS_BUCKET (+ ALB_PRIVATE_IP,
+                        # GATEWAY_IMAGE_TAG for the gateway manifests in Step 5)
 ```
+
+| Variable | What it is |
+| --- | --- |
+| `AWS_ACCOUNT_ID` | account owning the cluster/role/metrics (SA role ARN + `resource.aws.account_id`) |
+| `AWS_REGION` | region of the cluster/ALB/CloudWatch (`awsemf.region`) |
+| `OTEL_HOST` | collector hostname, covered by the ACM cert SAN (Ingress `rules[].host`) |
+| `ACM_CERT_ARN` | ACM cert ARN for the ALB (Ingress `certificate-arn`) |
+| `ALB_SUBNETS` | comma-separated private subnet IDs (Ingress `subnets`) |
+| `ALB_LOGS_BUCKET` | S3 bucket for ALB access logs |
+
+> The SA role ARN in the template is built from `AWS_ACCOUNT_ID` and the fixed
+> role name `claude-otel-collector-pod-identity-role` (Step 2's
+> `collector_role_arn`). If you renamed the role, edit the template's SA
+> annotation.
+
+**Render and apply** with `envsubst` (part of `gettext`; `brew install gettext`
+on macOS if missing):
+
+The easiest way is the [`deploy.sh`](./deploy.sh) helper, which loads
+`deploy.env`, checks that every required variable is set, renders **all** the
+manifest templates, and applies them:
+
+```bash
+./deploy.sh --render    # print the rendered YAML (inspect it first)
+./deploy.sh --dry-run   # kubectl apply --dry-run=client (validate, no changes)
+./deploy.sh --diff      # kubectl diff (what would change on the cluster)
+./deploy.sh             # render + kubectl apply
+```
+
+Under the hood that is just `envsubst` piped to `kubectl` — you can run a single
+template by hand if you prefer:
+
+```bash
+set -a && . ./deploy.env && set +a                      # export your values
+envsubst < k8s/otel-collector.template.yaml | kubectl apply -f -
+
+# To review before applying, drop the pipe:
+#   envsubst < k8s/otel-collector.template.yaml | less
+```
+
+> `envsubst` ships with `gettext` (`brew install gettext` on macOS if it's
+> missing). It replaces every `${VAR}` from your environment — `deploy.sh`
+> passes an explicit allow-list so only the intended variables are substituted.
 
 Wait for the collector to be ready:
 
@@ -168,31 +215,67 @@ aws elbv2 describe-target-health --region "$AWS_REGION" --target-group-arn "$TG"
 # Expect: healthy
 ```
 
-## Step 5: Point the gateway at the collector
+## Step 5: Point the gateway at the collector (the relay)
 
 Update the gateway's `gateway.yaml` (stored in Secrets Manager as
-`claude-gateway/config`) to **remove any `telemetry:` relay block** and add a
-`managed` policy that pushes the direct-send `OTEL_*` env vars to clients. See
-[`gateway.template.yaml`](./gateway.template.yaml) for the exact block:
+`claude-gateway/config`) to add a `telemetry.forward_to` block that relays to the
+collector's internal ALB. See [`gateway.template.yaml`](./gateway.template.yaml)
+for the fully-commented block:
 
 ```yaml
-managed:
-  policies:
-    - match: {}                       # catch-all: applies to every authenticated user
-      cli:
-        env:
-          CLAUDE_CODE_ENABLE_TELEMETRY: "1"
-          OTEL_METRICS_EXPORTER: otlp
-          OTEL_EXPORTER_OTLP_PROTOCOL: http/protobuf
-          OTEL_EXPORTER_OTLP_ENDPOINT: https://otel.example.com      # your $OTEL_HOST
-          OTEL_EXPORTER_OTLP_HEADERS: "Authorization=Bearer ${file:/secrets/otel-bearer-token}"
+telemetry:
+  forward_to:
+    - url: https://otel.example.com                       # your $OTEL_HOST (internal ALB; must match its ACM cert SAN)
+      headers:
+        Authorization: "Bearer <YOUR_OTEL_BEARER_TOKEN>"  # inline literal — see GOTCHA 2
+      metrics: true
+      logs: false
+      traces: false
 ```
 
-The gateway needs the bearer token mounted for the `${file:...}` expansion. Add
-it to the gateway's SecretProviderClass (see
-[`k8s/secret-provider-class.yaml`](./k8s/secret-provider-class.yaml), which
-already includes the `otel-bearer-token` object), then push the config and roll
-the gateway:
+Two things trip people up — both learned the hard way (see
+[`docs/otel-e2e-verification.md`](./docs/otel-e2e-verification.md)):
+
+- **GOTCHA 1 — `url` must be `https://`.** The gateway schema rejects `http://`
+  except for loopback, so you **cannot** relay to the plain-HTTP in-cluster
+  Service (`http://otel-collector...svc:4318`). Relay to the ALB (which
+  terminates TLS), and make the **gateway pod** resolve the ALB hostname to its
+  private IP via `hostAliases` (Step 5a). Connecting by hostname — not IP — is
+  required so TLS validates against the `*.<domain>` cert.
+- **GOTCHA 2 — `${file:...}` is NOT expanded in `forward_to.headers`.** The
+  gateway sends it as a literal string and the collector returns `401`. **Inline
+  the bearer token literal** in the header. It's the gateway's own config (never
+  pushed to clients), so inlining is safe; it must equal the collector's mounted
+  token.
+
+### Step 5a: Let the gateway resolve the ALB hostname
+
+The gateway Deployment ([`k8s/deployment.template.yaml`](./k8s/deployment.template.yaml))
+carries a `hostAliases` entry mapping `$OTEL_HOST` to an ALB private IP:
+
+```yaml
+spec:
+  template:
+    spec:
+      hostAliases:
+        - ip: "${ALB_PRIVATE_IP}"         # set in deploy.env; from: dig +short $ALB
+          hostnames:
+            - ${OTEL_HOST}
+```
+
+Set `ALB_PRIVATE_IP` in your `deploy.env` (pick one of the ALB's private IPs):
+
+```bash
+ALB=$(kubectl get ingress otel-collector -n claude-gateway \
+  -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
+dig +short "$ALB"        # copy one IP into deploy.env as ALB_PRIVATE_IP
+```
+
+> The ALB is internal, so its private IPs can change if it's recreated — update
+> `ALB_PRIVATE_IP` and re-apply (or move to a private Route 53 alias record for
+> the ALB) if the collector ingress is rebuilt.
+
+### Step 5b: Push the config and roll the gateway
 
 ```bash
 # Push the updated config (assumes you have your gateway.yaml locally):
@@ -200,58 +283,46 @@ aws secretsmanager put-secret-value --region "$AWS_REGION" \
   --secret-id claude-gateway/config \
   --secret-string "$(cat gateway.yaml)"
 
-# Ensure the bearer token is mounted into the gateway pod:
-kubectl apply -f k8s/secret-provider-class.yaml
+# Render + apply the gateway Deployment (and Ingress) with the hostAliases entry:
+set -a && . ./deploy.env && set +a
+envsubst < k8s/deployment.template.yaml | kubectl apply -f -
+envsubst < k8s/ingress.template.yaml    | kubectl apply -f -
 
-# Roll the gateway to pick up the new config + mount:
+# Roll the gateway to pick up the new config:
 kubectl rollout restart deploy/claude-gateway -n claude-gateway
 kubectl rollout status  deploy/claude-gateway -n claude-gateway --timeout=150s
 
 # Confirm a clean boot:
 kubectl logs -n claude-gateway -l app=claude-gateway -c gateway --tail=20 \
   | grep -E "config.load|managed settings|telemetry relay"
-# Expect: "telemetry relay: not configured" and "managed settings: configured"
+# Expect: "telemetry relay: 1 destination(s), signals enabled: metrics"
+#         "managed settings: configured"
 ```
 
-> **The gateway's IAM role must be able to read the new secret.** The main-README
-> `secrets-manager-read` policy is scoped to `claude-gateway/*`, which already
-> covers `claude-gateway/otel-bearer-token`. If you scoped it more tightly, widen
-> it.
+> **The gateway's IAM role must be able to read the bearer-token secret** (it's
+> mounted for the collector; the gateway only needs it if you prefer to source
+> the literal from the mount — this guide inlines it). The main-README
+> `secrets-manager-read` policy scoped to `claude-gateway/*` already covers it.
 
-## Step 6: Make the collector hostname resolve (client side)
+## Step 6: (No per-client DNS needed)
 
-Claude Code resolves `$OTEL_HOST` through the OS resolver and must reach the
-**internal** ALB over your private network (VPN, split tunnel, Direct Connect,
-etc.). Because the ALB is internal, the hostname must resolve to its **private**
-IPs. Pick one:
-
-- **Private Route 53 zone** (recommended): create an ALIAS record for
-  `$OTEL_HOST` → the ALB, in a private hosted zone associated with the VPC your
-  clients route into. Durable and handles ALB IP changes automatically.
-- **`/etc/hosts`** (quick, per-machine): map the hostname to one of the ALB's
-  private IPs. Static — if the ALB is recreated its IPs change, and you must
-  update the entry.
-
-```bash
-# Resolve the ALB's current private IPs:
-dig +short "$ALB"
-
-# /etc/hosts option (macOS/Linux):
-echo "<one-of-those-private-ips> ${OTEL_HOST}" | sudo tee -a /etc/hosts
-```
-
-> **Why not public DNS?** Claude Code's `/login` and gateway model require the
-> gateway to resolve to private addresses; the same private-network posture
-> applies here. Keeping the collector internal means the bearer token is
-> defense-in-depth, not the only control.
+With the relay, **clients talk only to the gateway** (`public_url`), which they
+already resolve and reach — the same endpoint they use for inference. The
+internal ALB is reached by the **gateway pod**, not by developer machines, so
+there is **no per-client `/etc/hosts` or private DNS** to set up. (This is the
+main operational win over the old direct-send approach.)
 
 ## Step 7: Roll it out to developers
 
-The gateway delivers the `OTEL_*` env vars through **managed settings**, which
-each client fetches on its next poll (within ~1 hour) or on the next
-`claude` restart / `/login`. Because these settings can influence the client,
-Claude Code shows a **one-time approval dialog** the first time — developers must
-accept it.
+The gateway **automatically** pushes the five telemetry env vars
+(`CLAUDE_CODE_ENABLE_TELEMETRY`, `OTEL_METRICS_EXPORTER`, `OTEL_LOGS_EXPORTER`,
+`OTEL_TRACES_EXPORTER`, `OTEL_EXPORTER_OTLP_ENDPOINT=<public_url>`) through
+**managed settings** the moment `telemetry.forward_to` + `listen.public_url` are
+set — no `managed.policies` block required. Each client fetches them on its next
+poll (within ~1 hour) or on the next `claude` restart / `/login`. Because the
+pushed OTLP endpoint can influence the client, Claude Code shows a **one-time
+approval dialog** the first time on **interactive** clients — developers must
+accept it. (Non-interactive `-p` runs skip the dialog.)
 
 To verify on your own machine, restart Claude Code, use it briefly, then check
 CloudWatch (allow ~1–2 minutes for the [metric delay](#metric-delay)):
@@ -297,12 +368,21 @@ End-to-end latency is roughly **1–2.5 minutes**, the sum of:
 | Stage | Delay | Why |
 | --- | --- | --- |
 | Client export interval | 0–60s | Claude Code exports every 60s (`OTEL_METRIC_EXPORT_INTERVAL` default) |
+| Gateway relay | ~instant | gateway forwards each received export verbatim |
 | Collector batch | 0–60s | `batch/metrics.timeout: 60s` in the ConfigMap |
 | EMF → CloudWatch ingestion | ~5–15s | EMF log event parsed into a metric |
 
-To tighten to ~20–30s, push `OTEL_METRIC_EXPORT_INTERVAL=10000` in the managed
-policy `env` and set `batch/metrics.timeout: 10s` in the ConfigMap (at the cost
-of more, smaller CloudWatch writes).
+To tighten to ~20–30s, add `OTEL_METRIC_EXPORT_INTERVAL=10000` via a
+`managed.policies` `env` block (it is on the CLI safe list) and set
+`batch/metrics.timeout: 10s` in the ConfigMap (at the cost of more, smaller
+CloudWatch writes).
+
+> **Short-lived `claude -p` runs may not export at all.** A one-shot that
+> finishes in a couple of seconds can exit before the first export tick fires.
+> When testing end-to-end, either lower `OTEL_METRIC_EXPORT_INTERVAL` (e.g.
+> `2000`) **and** give the run enough work to live past a tick, or just verify
+> against organic interactive usage. This is a client-side timing artifact, not
+> a pipeline fault.
 
 ## Troubleshooting
 
@@ -311,16 +391,37 @@ of more, smaller CloudWatch writes).
 | Collector pod stuck `ContainerCreating`, event `An IAM role must be associated with service account` | The SA lacks the IRSA annotation, or the role doesn't trust IRSA | Ensure the SA has `eks.amazonaws.com/role-arn` and the Terraform role includes the `IRSA` trust statement (it does by default) |
 | Collector event `Failed to fetch secret ... Verify secret exists and required permissions` | Role can't read the bearer token | Confirm Step 1 created `claude-gateway/otel-bearer-token` and the Terraform `SecretsManagerRead` statement covers it |
 | Collector boots but `bearertokenauth` is an `unknown type` | Using the ADOT image instead of contrib | Use `otel/opentelemetry-collector-contrib` (Step 3 note) |
-| Client POST returns `401` | Missing/wrong bearer token | The gateway pushes the token via managed settings; ensure the client accepted the approval dialog and the gateway config expands `${file:/secrets/otel-bearer-token}` |
-| TLS error / hostname mismatch on the client | ACM cert doesn't cover `$OTEL_HOST`, or DNS points elsewhere | Cert SAN must cover the hostname; `$OTEL_HOST` must resolve to the ALB's private IPs (Step 6) |
-| `list-metrics` empty after a single test request | Cumulative-counter baselining | Send at least two increasing datapoints, or just use the CLI normally for a couple of minutes |
+| Gateway logs `otel forward to https://… failed: 401` | `${file:...}` used in `forward_to.headers` (sent literally), or the inlined token ≠ collector's mounted token | Inline the literal token in the header (GOTCHA 2); confirm it equals `aws secretsmanager get-secret-value --secret-id claude-gateway/otel-bearer-token` |
+| Gateway boot fails: `forward_to.url must be https:// (http:// allowed for loopback only)` | Relaying to the plain-HTTP in-cluster Service | Relay to the ALB over `https://` + add `hostAliases` (GOTCHA 1 / Step 5a) |
+| Gateway logs `otel forward … failed` with a TLS/hostname error | Gateway can't resolve `$OTEL_HOST` to the ALB, or connects by IP so TLS won't validate | Add/fix the `hostAliases` entry (Step 5a); the ALB cert SAN must cover `$OTEL_HOST` |
+| Collector boots but `bearertokenauth` is an `unknown type` | Using the ADOT image instead of contrib | Use `otel/opentelemetry-collector-contrib` (Step 3 note) |
+| Collector event `Failed to fetch secret ...` | Role can't read the bearer token | Confirm Step 1 created `claude-gateway/otel-bearer-token` and the Terraform `SecretsManagerRead` statement covers it |
+| `list-metrics` empty after a single test request | Cumulative-counter baselining, or the `-p` run exited before an export tick | Send at least two increasing datapoints; use a longer run + low `OTEL_METRIC_EXPORT_INTERVAL`, or verify against organic usage |
 | ALB target `unhealthy` | Health check misconfigured | The Ingress health-checks port `13133` path `/`; confirm the collector's `health_check` extension is listening |
-| Gateway boot fails after the config change | `${file:/secrets/otel-bearer-token}` not mounted | Apply `k8s/secret-provider-class.yaml` (includes the token) **before** rolling the gateway |
+| No client user-agent in ALB logs, only `curl` | Direct-send was configured (superseded) | Switch to the relay (Step 5); with relay the ALB sees `ua="Bun/..."` from the gateway pod, not the client |
+
+**How to verify end-to-end** (what "working" looks like):
+
+```bash
+# 1. Gateway relaying with no errors:
+kubectl logs -n claude-gateway -l app=claude-gateway -c gateway --since=15m | grep -c 401   # expect 0
+
+# 2. ALB access log shows gateway-origin POSTs returning 200 (ua = the gateway runtime, e.g. Bun):
+#    (decode the newest object under s3://<alb-logs-bucket>/otel/AWSLogs/.../elasticloadbalancing/...)
+#    each line: ... "POST https://$OTEL_HOST/v1/metrics" ... 200 ... "Bun/x.y.z" ...
+
+# 3. Fresh datapoints in CloudWatch for a real user:
+aws cloudwatch get-metric-statistics --region "$AWS_REGION" --namespace ClaudeCode \
+  --metric-name claude_code.token.usage --dimensions Name=user.email,Value=you@example.com \
+  --start-time "$(date -u -v-15M +%Y-%m-%dT%H:%M:%SZ)" --end-time "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+  --period 60 --statistics Sum
+```
 
 ## Rollback
 
-To revert to gateway-relayed telemetry (or disable it entirely): remove the
-`managed.policies` `env` OTEL vars from `gateway.yaml`, optionally restore a
-`telemetry.forward_to` block, and roll the gateway. The collector Deployment and
-ALB can stay running (harmless if no client points at them) or be removed with
-`kubectl delete -f k8s/otel-collector.yaml` and `terraform destroy`.
+To disable telemetry: remove the `telemetry.forward_to` block from `gateway.yaml`
+and roll the gateway (boot log will show `telemetry relay: not configured`, and
+the gateway stops auto-pushing the `OTEL_*` env vars). The collector Deployment
+and ALB can stay running (harmless if nothing points at them) or be removed with
+`kubectl delete -f k8s/otel-collector.yaml` and `terraform destroy`. You may also
+want to drop the `hostAliases` entry from `k8s/deployment.yaml`.
