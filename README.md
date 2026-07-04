@@ -15,29 +15,35 @@ For usage telemetry, see [README-OTEL.md](./README-OTEL.md).
 
 ```mermaid
 flowchart TB
-    tf["<b>terraform apply</b>"]
-    tf --> eks["EKS cluster<br/>(Auto Mode)"]
-    tf --> rds[("RDS<br/>PostgreSQL")]
-    tf --> ecr["ECR<br/>repository"]
-    tf --> iam["IAM role<br/>(Pod Identity)"]
-    tf --> sm["Secrets Manager<br/>jwt · admin · postgres-url<br/>+ config / oidc placeholders"]
+    dev["Developer machine<br/>(Claude Code)"]
 
-    build["<b>docker build / push</b>"] --> ecr
+    subgraph aws["AWS account (VPC)"]
+        alb["Internal ALB<br/>HTTPS 443 · ACM cert"]
 
-    kubectl["<b>kubectl apply</b>"]
-    kubectl --> ns["namespace + ServiceAccount"]
-    kubectl --> csi["Secrets Store CSI driver<br/>+ SecretProviderClasses"]
-    kubectl --> workload["Deployment + internal ALB Ingress"]
+        subgraph eks["Amazon EKS (Auto Mode)"]
+            direction TB
+            sa["ServiceAccount: gateway<br/>Pod Identity association"]
+            pod["claude-gateway pod<br/>container :8080<br/>/readyz · /healthz"]
+            csi["Secrets Store CSI driver<br/>mounts /secrets + /etc/claude"]
+            sa -.binds.- pod
+            csi -->|volume mount| pod
+        end
 
-    ecr -.image.-> workload
-    sm -.mounted via CSI.-> workload
-    vpc["Existing VPC<br/>(referenced read-only,<br/>never created or destroyed)"] -.-> eks
-    vpc -.-> rds
+        sm["AWS Secrets Manager<br/>claude-gateway/*<br/>config · jwt · oidc · postgres-url<br/>admin-read/write keys"]
+        rds[("Amazon RDS PostgreSQL 16<br/>claude_gateway<br/>private subnets only")]
+        iam["IAM role<br/>claude-gateway-pod-identity-role<br/>bedrock-invoke + secrets-manager-read"]
+        bedrock["Amazon Bedrock<br/>Claude inference profiles"]
+    end
 
-    classDef step fill:#e8f0fe,stroke:#4285f4,stroke-width:2px;
-    classDef ext fill:#f5f5f5,stroke:#9aa0a6,stroke-dasharray:4 3;
-    class tf,build,kubectl step;
-    class vpc ext;
+    idp["OIDC IdP<br/>(Google / Okta / Azure AD)"]
+
+    dev -->|HTTPS| alb
+    alb -->|:8080| pod
+    pod -->|OIDC login| idp
+    pod -->|token usage / spend| rds
+    csi -->|GetSecretValue| sm
+    pod -->|assumes / IAM creds| iam
+    iam -->|InvokeModel*| bedrock
 ```
 
 ## Prerequisites
