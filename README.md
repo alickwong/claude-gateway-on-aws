@@ -1,592 +1,217 @@
-# Deploy Claude Apps Gateway on AWS
+# Claude Apps Gateway on AWS — Quick Start
 
-> **Note:** This page walks through one way to run Claude apps gateway on AWS. The configuration is a working example for customer-managed infrastructure rather than a supported production deployment; use it to see how the pieces fit together before adapting it to your own environment. For the platform-agnostic requirements, see the [deployment guide](https://code.claude.com/docs/en/claude-apps-gateway-deploy).
+> **Note:** This is a working example for customer-managed infrastructure, not a
+> supported production deployment — use it to see how the pieces fit together
+> before adapting it to your own environment. For the platform-agnostic
+> requirements, see the
+> [deployment guide](https://code.claude.com/docs/en/claude-apps-gateway-deploy).
 
-This example provisions Claude apps gateway on AWS with Amazon Bedrock as the model upstream, using EKS for compute. Any OpenID Connect (OIDC) compliant IdP works for authentication; only the `oidc` block changes. See [Identity provider setup](https://code.claude.com/docs/en/claude-apps-gateway-deploy#identity-provider-setup) for per-IdP details.
+This deploys the whole gateway stack on AWS. **Terraform** provisions everything
+except the VPC (EKS Auto Mode cluster, RDS PostgreSQL, ECR, IAM Pod Identity
+role, and Secrets Manager); you then build the image and apply a handful of
+Kubernetes manifests. End to end is ~25 minutes, most of it EKS + RDS creation.
 
-> **⚠️ The gateway URL must resolve to a private address.** At `/login`, Claude Code requires the gateway's hostname or IP to resolve **only** to private addresses: RFC 1918 (`10/8`, `172.16/12`, `192.168/16`), CGNAT (`100.64.0.0/10`), IPv6 ULA (`fc00::/7`), or loopback for local development. The check runs on *each* resolved IP — if the name resolves to **any** public address, `/login` rejects the URL. This is why the reference deployment uses an **internal** ALB.
->
-> If developer machines route HTTPS through a corporate proxy, sign-in also requires the **proxy host** to resolve to private addresses. If it doesn't, add the gateway host to `NO_PROXY` so the CLI connects directly.
+For usage telemetry, see [README-OTEL.md](./README-OTEL.md).
 
-## What you'll build
-
-The reference configuration provisions:
-
-* **Amazon EKS** cluster running the gateway container (with ECS Fargate as an alternative)
-* **Amazon ECR** repository for the gateway image
-* **Amazon RDS for PostgreSQL** instance, private subnets only, for the gateway's [store](https://code.claude.com/docs/en/claude-apps-gateway-config#store)
-* **AWS Secrets Manager** secrets for `gateway.yaml`, the JWT signing key, the OIDC client secret, and the Postgres URL
-* **IAM Role** with `bedrock:InvokeModel*` and Secrets Manager read permissions, bound via EKS Pod Identity (or task role on ECS)
-* **Internal Application Load Balancer (ALB)** for HTTPS termination
-
-## Architecture
-
-```mermaid
-flowchart TB
-    dev["Developer machine<br/>(Claude Code)"]
-
-    subgraph aws["AWS account · ap-southeast-2 (VPC)"]
-        alb["Internal ALB<br/>HTTPS 443 · ACM cert"]
-
-        subgraph eks["Amazon EKS (Auto Mode)"]
-            direction TB
-            sa["ServiceAccount: gateway<br/>Pod Identity association"]
-            pod["claude-gateway pod<br/>container :8080<br/>/readyz · /healthz"]
-            csi["Secrets Store CSI driver<br/>mounts /secrets + /etc/claude"]
-            sa -.binds.- pod
-            csi -->|volume mount| pod
-        end
-
-        sm["AWS Secrets Manager<br/>claude-gateway/*<br/>config · jwt · oidc · postgres-url<br/>admin-read/write keys"]
-        rds[("Amazon RDS PostgreSQL 16<br/>claude_gateway<br/>private subnets only")]
-        iam["IAM role<br/>claude-gateway-pod-identity-role<br/>bedrock-invoke + secrets-manager-read"]
-        bedrock["Amazon Bedrock<br/>Claude inference profiles"]
-    end
-
-    idp["OIDC IdP<br/>(Google / Okta / Azure AD)"]
-
-    dev -->|HTTPS| alb
-    alb -->|:8080| pod
-    pod -->|OIDC login| idp
-    pod -->|token usage / spend| rds
-    csi -->|GetSecretValue| sm
-    pod -->|assumes / IAM creds| iam
-    iam -->|InvokeModel*| bedrock
 ```
-
-> Auth flows via **EKS Pod Identity**: the `gateway` ServiceAccount is associated with `claude-gateway-pod-identity-role`, which grants Bedrock invocation and Secrets Manager reads. Everything except the developer's inbound HTTPS and the OIDC redirect stays inside the VPC.
+Terraform  ──▶  EKS (Auto Mode) · RDS · ECR · IAM (Pod Identity) · Secrets Manager
+   │                                   (VPC referenced read-only, never destroyed)
+   ▼
+docker build/push  ──▶  ECR
+   ▼
+kubectl apply      ──▶  namespace · CSI driver · SecretProviderClasses ·
+                        Deployment · internal ALB Ingress
+```
 
 ## Prerequisites
 
-* An AWS account with permission to create the resources above
-* The `aws` CLI configured and authenticated, `kubectl`, `helm`, and Docker installed locally
-* For the EKS track: an EKS cluster (or you'll create one below)
-* Access to the Claude models you need in Amazon Bedrock, enabled in the target region
-* An OIDC provider (e.g., Okta, Azure AD, Google Workspace) with a web-application client and redirect URI `https://<gateway-host>/oauth/callback`
-* A TLS hostname for the gateway (internal DNS name pointing at the ALB) and an ACM certificate
-* A VPC with at least 2 private subnets across different AZs
+- `aws` CLI (authenticated), `terraform` ≥ 1.5, `kubectl`, `helm`, `docker`,
+  and `envsubst` (`brew install gettext`).
+- An **existing VPC** with **≥ 2 private subnets** in different AZs, each with
+  **NAT egress** (EKS nodes and RDS live here). The VPC is *not* created or
+  destroyed by Terraform.
+- **Bedrock model access** enabled in your region for the Claude models you need.
+- An **OIDC provider** (Google/Okta/Azure AD) with a web client and redirect URI
+  `https://<gateway-host>/oauth/callback`.
+- An **ACM certificate** whose SAN covers your gateway hostname, in the same region.
+- The gateway container binary at `build/claude` (see [Dockerfile](./Dockerfile)).
 
-Set the account and region once:
+## Step 1 — Provision infrastructure with Terraform
 
 ```bash
-export AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
-export AWS_REGION=ap-southeast-2   # a region where the Claude models you need are available in Bedrock
-export VPC_ID=<your-vpc-id>
-export PRIVATE_SUBNET_IDS=<subnet-1-id>,<subnet-2-id>   # private subnets for RDS and EKS
-export CLUSTER_NAME=claude-gateway-cluster
+cd terraform/gateway
+cp terraform.tfvars.example terraform.tfvars
+$EDITOR terraform.tfvars        # set vpc_id + private_subnet_ids (and region)
+
+terraform init
+terraform apply                 # ~15-20 min (EKS + RDS)
 ```
 
-## Deploy the gateway
+Terraform creates (all prefixed `claude-gateway-tf` by default — change
+`name_prefix` to run multiple isolated stacks):
 
-### Step 1: Create the ECR repository and push the image
+| Resource | Name |
+| --- | --- |
+| EKS Auto Mode cluster | `claude-gateway-tf-test` |
+| RDS PostgreSQL 16 | `claude-gateway-tf-db` (private, encrypted) |
+| ECR repository | `claude-gateway-tf/claude-gateway` |
+| Gateway IAM role (Pod Identity) | `claude-gateway-tf-pod-identity-role` |
+| Secrets | `claude-gateway-tf/{jwt-secret,admin-read-key,admin-write-key,postgres-url,oidc-client-secret,config}` |
+
+`jwt-secret`, `admin-*`, and `postgres-url` are generated by Terraform.
+`oidc-client-secret` and `config` are created as **placeholders** you overwrite
+in Step 3 (so real IdP secrets and config never sit in Terraform state).
+
+Save the outputs:
 
 ```bash
-aws ecr create-repository \
-  --repository-name claude-gateway \
-  --region "$AWS_REGION" \
-  --image-scanning-configuration scanOnPush=true
-
-aws ecr get-login-password --region "$AWS_REGION" | \
-  docker login --username AWS --password-stdin "${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
-
-# Build the image per the container image requirements using the linux-x64 glibc binary
-docker build --platform=linux/amd64 \
-  -t "${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/claude-gateway:<version>" .
-docker push "${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/claude-gateway:<version>"
+export AWS_REGION=$(terraform output -raw region)
+export CLUSTER_NAME=$(terraform output -raw cluster_name)
+export ECR_URL=$(terraform output -raw ecr_repository_url)
+eval "$(terraform output -raw update_kubeconfig_cmd)"   # writes kubeconfig
+cd ../..
 ```
 
-### Step 2: Provision Amazon RDS for PostgreSQL
-
-Create a DB subnet group and a PostgreSQL instance in private subnets only:
+## Step 2 — Build and push the gateway image
 
 ```bash
-# Security group for RDS — allows inbound from EKS pods
-aws ec2 create-security-group \
-  --group-name claude-gateway-rds-sg \
-  --description "Claude gateway RDS access" \
-  --vpc-id "$VPC_ID" \
-  --output text --query 'GroupId'
-# Save the output as RDS_SG_ID
+AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+aws ecr get-login-password --region "$AWS_REGION" \
+  | docker login --username AWS --password-stdin "${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
 
-RDS_SG_ID=<output-from-above>
-
-# Allow PostgreSQL traffic from EKS pod CIDR or the EKS security group
-aws ec2 authorize-security-group-ingress \
-  --group-id "$RDS_SG_ID" \
-  --protocol tcp --port 5432 \
-  --source-group <eks-node-or-pod-security-group-id>
-
-# Create subnet group
-aws rds create-db-subnet-group \
-  --db-subnet-group-name claude-gateway-db-subnet \
-  --db-subnet-group-description "Private subnets for Claude gateway DB" \
-  --subnet-ids <subnet-1-id> <subnet-2-id>
-
-# Generate a password
-PGPASS="$(openssl rand -hex 24)"
-
-# Create RDS instance
-aws rds create-db-instance \
-  --db-instance-identifier claude-gateway-db \
-  --db-instance-class db.t4g.small \
-  --engine postgres \
-  --engine-version 16 \
-  --master-username gateway \
-  --master-user-password "$PGPASS" \
-  --allocated-storage 20 \
-  --storage-encrypted \
-  --no-publicly-accessible \
-  --vpc-security-group-ids "$RDS_SG_ID" \
-  --db-subnet-group-name claude-gateway-db-subnet \
-  --db-name claude_gateway \
-  --backup-retention-period 7
-
-# Wait for the instance to become available
-aws rds wait db-instance-available --db-instance-identifier claude-gateway-db
-
-# Get the endpoint
-RDS_ENDPOINT=$(aws rds describe-db-instances \
-  --db-instance-identifier claude-gateway-db \
-  --query 'DBInstances[0].Endpoint.Address' --output text)
-
-GATEWAY_POSTGRES_URL="postgres://gateway:${PGPASS}@${RDS_ENDPOINT}:5432/claude_gateway?sslmode=require"
+docker build --platform=linux/amd64 -t "${ECR_URL}:v1" .
+docker push "${ECR_URL}:v1"
 ```
 
-### Step 3: Create the IAM role for the gateway
+## Step 3 — Write and store `gateway.yaml`
 
-Create an IAM role the gateway pod assumes to (1) invoke Bedrock models and (2) let the Secrets Store CSI driver read the gateway's secrets. This guide uses **EKS Pod Identity** (the current recommended mechanism); see the note at the end of this step for the IRSA alternative.
-
-> **Important — inference profiles:** Claude Code invokes models through Bedrock **inference profiles** (e.g. `au.anthropic.claude-opus-4-6-v1`, `global.anthropic.claude-opus-4-8`), not bare foundation-model IDs. When you invoke via an inference profile, Bedrock authorizes the request against **both** the `inference-profile/*` ARN **and** the underlying `foundation-model/*` ARNs in every region the profile can route to. A policy that only grants `foundation-model/anthropic.*` will fail with `403 ... is not authorized to perform: bedrock:InvokeModelWithResponseStream on resource: arn:aws:bedrock:<region>:<account>:inference-profile/...`. You must grant both resource types.
+Fill in your IdP and hostname, then overwrite the two placeholder secrets:
 
 ```bash
-# Create the IAM policy for Bedrock access.
-# NOTE: covers foundation models AND inference profiles (required for
-# cross-region / geo inference profiles like au.* and global.*).
-cat > /tmp/bedrock-policy.json << EOF
-{
-  "Version": "2012-10-17",
-  "Statement": [
-    {
-      "Sid": "InvokeFoundationModels",
-      "Effect": "Allow",
-      "Action": [
-        "bedrock:InvokeModel",
-        "bedrock:InvokeModelWithResponseStream"
-      ],
-      "Resource": "arn:aws:bedrock:*::foundation-model/anthropic.*"
-    },
-    {
-      "Sid": "InvokeInferenceProfiles",
-      "Effect": "Allow",
-      "Action": [
-        "bedrock:InvokeModel",
-        "bedrock:InvokeModelWithResponseStream"
-      ],
-      "Resource": [
-        "arn:aws:bedrock:*:${AWS_ACCOUNT_ID}:inference-profile/*",
-        "arn:aws:bedrock:*:${AWS_ACCOUNT_ID}:application-inference-profile/*"
-      ]
-    }
-  ]
-}
-EOF
-
-aws iam create-policy \
-  --policy-name claude-gateway-bedrock-access \
-  --policy-document file:///tmp/bedrock-policy.json
-
-BEDROCK_POLICY_ARN="arn:aws:iam::${AWS_ACCOUNT_ID}:policy/claude-gateway-bedrock-access"
-
-# Policy allowing the Secrets Store CSI driver to read the gateway's secrets.
-# Without this the pod's secret/config volumes fail to mount.
-cat > /tmp/secrets-policy.json << EOF
-{
-  "Version": "2012-10-17",
-  "Statement": [
-    {
-      "Effect": "Allow",
-      "Action": [
-        "secretsmanager:GetSecretValue",
-        "secretsmanager:DescribeSecret"
-      ],
-      "Resource": "arn:aws:secretsmanager:${AWS_REGION}:${AWS_ACCOUNT_ID}:secret:claude-gateway/*"
-    }
-  ]
-}
-EOF
-
-aws iam create-policy \
-  --policy-name claude-gateway-secrets-access \
-  --policy-document file:///tmp/secrets-policy.json
-
-SECRETS_POLICY_ARN="arn:aws:iam::${AWS_ACCOUNT_ID}:policy/claude-gateway-secrets-access"
-
-# Trust policy for EKS Pod Identity — the pod identity agent assumes this role.
-cat > /tmp/trust-policy.json << EOF
-{
-  "Version": "2012-10-17",
-  "Statement": [
-    {
-      "Effect": "Allow",
-      "Principal": { "Service": "pods.eks.amazonaws.com" },
-      "Action": ["sts:AssumeRole", "sts:TagSession"]
-    }
-  ]
-}
-EOF
-
-aws iam create-role \
-  --role-name claude-gateway-pod-identity-role \
-  --assume-role-policy-document file:///tmp/trust-policy.json
-
-aws iam attach-role-policy \
-  --role-name claude-gateway-pod-identity-role \
-  --policy-arn "$BEDROCK_POLICY_ARN"
-
-aws iam attach-role-policy \
-  --role-name claude-gateway-pod-identity-role \
-  --policy-arn "$SECRETS_POLICY_ARN"
-```
-
-> **IRSA alternative:** If you prefer IAM Roles for Service Accounts instead of Pod Identity, use this trust policy on the role instead of the one above (requires an IAM OIDC provider on the cluster), and skip the `create-pod-identity-association` in Step 6a:
->
-> ```bash
-> OIDC_PROVIDER=$(aws eks describe-cluster --name "$CLUSTER_NAME" \
->   --query "cluster.identity.oidc.issuer" --output text | sed 's|https://||')
-> # Principal: { "Federated": "arn:aws:iam::${AWS_ACCOUNT_ID}:oidc-provider/${OIDC_PROVIDER}" }
-> # Action: "sts:AssumeRoleWithWebIdentity"
-> # Condition StringEquals:
-> #   "${OIDC_PROVIDER}:sub": "system:serviceaccount:claude-gateway:gateway"
-> #   "${OIDC_PROVIDER}:aud": "sts.amazonaws.com"
-> ```
-
-### Step 4: Store secrets in AWS Secrets Manager
-
-```bash
-# JWT signing secret
-JWT_SECRET=$(openssl rand -base64 32)
-aws secretsmanager create-secret \
-  --name claude-gateway/jwt-secret \
-  --secret-string "$JWT_SECRET"
-
-# OIDC client secret (from your IdP)
-aws secretsmanager create-secret \
-  --name claude-gateway/oidc-client-secret \
+# 1. OIDC client secret from your IdP:
+aws secretsmanager put-secret-value --region "$AWS_REGION" \
+  --secret-id claude-gateway-tf/oidc-client-secret \
   --secret-string "<your-oidc-client-secret>"
 
-# Postgres URL
-aws secretsmanager create-secret \
-  --name claude-gateway/postgres-url \
-  --secret-string "$GATEWAY_POSTGRES_URL"
-
-# Admin API keys — read-only (reporting) and read-write (admin)
-aws secretsmanager create-secret \
-  --name claude-gateway/admin-read-key \
-  --secret-string "$(openssl rand -base64 32)"
-aws secretsmanager create-secret \
-  --name claude-gateway/admin-write-key \
-  --secret-string "$(openssl rand -base64 32)"
-
-# Full gateway.yaml config (created in next step)
-aws secretsmanager create-secret \
-  --name claude-gateway/config \
-  --secret-string file://gateway.yaml
+# 2. gateway.yaml — see gateway.template.yaml for a fully-commented example.
+#    listen.public_url must be your internal gateway hostname (HTTPS).
+aws secretsmanager put-secret-value --region "$AWS_REGION" \
+  --secret-id claude-gateway-tf/config \
+  --secret-string "$(cat gateway.yaml)"
 ```
 
-### Step 5: Write gateway.yaml
+The `store.postgres_url`, `session.jwt_secret`, and `admin.*` keys in
+`gateway.yaml` use `${file:/secrets/...}` — those files are mounted from the
+Terraform-created secrets by the CSI driver in Step 4.
 
-The `upstreams` block points at Amazon Bedrock with `auth: {}`, so the gateway authenticates via the pod's IAM credentials (Pod Identity or IRSA). See the [configuration reference](https://code.claude.com/docs/en/claude-apps-gateway-config) for every field.
+## Step 4 — Deploy on EKS
 
-```yaml
-# gateway.yaml — Google Workspace example
-listen:
-  host: 0.0.0.0
-  port: 8080
-  public_url: https://claude-gateway.internal.example.com
-  trusted_proxies: [10.0.0.0/8]   # VPC CIDR / ALB subnet range
-
-oidc:
-  issuer: https://accounts.google.com
-  client_id: <your-oauth-client-id>
-  client_secret: ${file:/secrets/oidc-client-secret}
-  allowed_email_domains: [example.com]
-  scopes: [openid, profile, email]
-  extra_auth_params: { access_type: offline, prompt: consent }
-
-session:
-  jwt_secret: ${file:/secrets/jwt-secret}
-
-store:
-  postgres_url: ${file:/secrets/postgres-url}
-
-admin:
-  read_keys:
-    - { id: reporting, key: "${file:/secrets/admin-read-key}" }
-  write_keys:
-    - { id: admin, key: "${file:/secrets/admin-write-key}" }
-  admin_groups: [<your-admin-email-or-group>]
-
-upstreams:
-  - provider: bedrock
-    region: ap-southeast-2         # must match $AWS_REGION
-    auth: {}                       # uses the pod's IAM credentials (Pod Identity / IRSA)
-```
-
-> **Note:** Adjust the `oidc` block for your identity provider. The example shows Google Workspace. For Azure AD, use `issuer: https://login.microsoftonline.com/<tenant-id>/v2.0` and add `offline_access` to `scopes` instead of `extra_auth_params`. For Okta, use `issuer: https://<your-org>.okta.com`. The `extra_auth_params` field passes additional parameters to the authorization endpoint — Google requires `access_type: offline` to issue refresh tokens.
-
-### Step 6: Deploy on EKS
-
-#### 6a. Set up the namespace and service account
+The gateway ServiceAccount is already bound to the IAM role via a Terraform
+**Pod Identity association**, so you only create the namespace + SA (no
+annotation needed).
 
 ```bash
 kubectl create namespace claude-gateway
-
 kubectl create serviceaccount gateway -n claude-gateway
 
-# Associate the service account with the IAM role via EKS Pod Identity.
-# On EKS Auto Mode clusters the Pod Identity agent is built into the node —
-# nothing to install. On a standard cluster, add the agent first:
-#   aws eks create-addon --cluster-name "$CLUSTER_NAME" --addon-name eks-pod-identity-agent
-aws eks create-pod-identity-association \
-  --cluster-name "$CLUSTER_NAME" \
-  --namespace claude-gateway \
-  --service-account gateway \
-  --role-arn "arn:aws:iam::${AWS_ACCOUNT_ID}:role/claude-gateway-pod-identity-role"
-```
+# The Secrets Store CSI AWS provider resolves the role via IRSA (the SA's
+# role-arn annotation), so annotate the SA even though Pod Identity is also
+# associated. (Terraform created the IAM OIDC provider + IRSA trust for you.)
+GATEWAY_ROLE_ARN=$(cd terraform/gateway && terraform output -raw gateway_role_arn)
+kubectl annotate serviceaccount gateway -n claude-gateway \
+  eks.amazonaws.com/role-arn="$GATEWAY_ROLE_ARN"
 
-> **Using IRSA instead?** Skip the association above and annotate the service account with the role ARN:
-> ```bash
-> kubectl annotate serviceaccount gateway -n claude-gateway \
->   eks.amazonaws.com/role-arn="arn:aws:iam::${AWS_ACCOUNT_ID}:role/claude-gateway-pod-identity-role"
-> ```
-
-#### 6b. Install the AWS Secrets Manager CSI driver
-
-```bash
-# Install the Secrets Store CSI driver
+# Secrets Store CSI driver + AWS provider (EKS Auto Mode does NOT bundle these).
+# IMPORTANT: tokenRequests[0].audience is REQUIRED — without it, mounts fail with
+# "serviceAccount.tokens not provided - ensure tokenRequests is configured".
 helm repo add secrets-store-csi-driver https://kubernetes-sigs.github.io/secrets-store-csi-driver/charts
 helm install csi-secrets-store secrets-store-csi-driver/secrets-store-csi-driver \
   --namespace kube-system \
-  --set syncSecret.enabled=true
-
-# Install the AWS provider
+  --set syncSecret.enabled=true \
+  --set 'tokenRequests[0].audience=sts.amazonaws.com'
 kubectl apply -f https://raw.githubusercontent.com/aws/secrets-store-csi-driver-provider-aws/main/deployment/aws-provider-installer.yaml
-```
 
-#### 6c. Create the SecretProviderClasses
-
-The gateway uses two separate SecretProviderClasses: one for secrets (mounted at `/secrets`) and one for the config file (mounted at `/etc/claude`):
-
-```yaml
-# secret-provider-class.yaml
-apiVersion: secrets-store.csi.x-k8s.io/v1
-kind: SecretProviderClass
-metadata:
-  name: claude-gateway-secrets
-  namespace: claude-gateway
-spec:
-  provider: aws
-  parameters:
-    objects: |
-      - objectName: "claude-gateway/jwt-secret"
-        objectType: "secretsmanager"
-        objectAlias: "jwt-secret"
-      - objectName: "claude-gateway/oidc-client-secret"
-        objectType: "secretsmanager"
-        objectAlias: "oidc-client-secret"
-      - objectName: "claude-gateway/postgres-url"
-        objectType: "secretsmanager"
-        objectAlias: "postgres-url"
-      - objectName: "claude-gateway/admin-read-key"
-        objectType: "secretsmanager"
-        objectAlias: "admin-read-key"
-      - objectName: "claude-gateway/admin-write-key"
-        objectType: "secretsmanager"
-        objectAlias: "admin-write-key"
----
-apiVersion: secrets-store.csi.x-k8s.io/v1
-kind: SecretProviderClass
-metadata:
-  name: claude-gateway-config
-  namespace: claude-gateway
-spec:
-  provider: aws
-  parameters:
-    objects: |
-      - objectName: "claude-gateway/config"
-        objectType: "secretsmanager"
-        objectAlias: "gateway.yaml"
-```
-
-```bash
-kubectl apply -f secret-provider-class.yaml
-```
-
-#### 6d. Deploy the gateway
-
-```yaml
-# deployment.yaml
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: claude-gateway
-  namespace: claude-gateway
-spec:
-  replicas: 1
-  selector:
-    matchLabels:
-      app: claude-gateway
-  template:
-    metadata:
-      labels:
-        app: claude-gateway
-    spec:
-      serviceAccountName: gateway
-      containers:
-        - name: gateway
-          image: <account-id>.dkr.ecr.<region>.amazonaws.com/claude-gateway:<version>
-          ports:
-            - containerPort: 8080
-              protocol: TCP
-          readinessProbe:
-            httpGet:
-              path: /readyz
-              port: 8080
-            initialDelaySeconds: 10
-            periodSeconds: 10
-          livenessProbe:
-            httpGet:
-              path: /healthz
-              port: 8080
-            initialDelaySeconds: 15
-            periodSeconds: 20
-          resources:
-            requests:
-              cpu: "500m"
-              memory: "512Mi"
-            limits:
-              cpu: "1000m"
-              memory: "1Gi"
-          volumeMounts:
-            - name: secrets
-              mountPath: /secrets
-              readOnly: true
-            - name: config
-              mountPath: /etc/claude
-              readOnly: true
-      volumes:
-        - name: secrets
-          csi:
-            driver: secrets-store.csi.k8s.io
-            readOnly: true
-            volumeAttributes:
-              secretProviderClass: claude-gateway-secrets
-        - name: config
-          csi:
-            driver: secrets-store.csi.k8s.io
-            readOnly: true
-            volumeAttributes:
-              secretProviderClass: claude-gateway-config
----
-apiVersion: v1
-kind: Service
-metadata:
-  name: claude-gateway
-  namespace: claude-gateway
-spec:
-  type: ClusterIP
-  selector:
-    app: claude-gateway
-  ports:
-    - port: 8080
-      targetPort: 8080
-      protocol: TCP
-```
-
-```bash
-kubectl apply -f deployment.yaml
-```
-
-#### 6e. Create the internal ALB Ingress
-
-Install the AWS Load Balancer Controller if not already present:
-
-```bash
-helm repo add eks https://aws.github.io/eks-charts
-helm install aws-load-balancer-controller eks/aws-load-balancer-controller \
-  -n kube-system \
-  --set clusterName="$CLUSTER_NAME" \
-  --set serviceAccount.create=false \
-  --set serviceAccount.name=aws-load-balancer-controller
-```
-
-Create the Ingress resource:
-
-```yaml
-# ingress.yaml
+# EKS Auto Mode has a built-in LB controller (controller name eks.amazonaws.com/alb)
+# but does NOT pre-create an IngressClass — create one so the ALB Ingress works:
+kubectl apply -f - <<'EOF'
 apiVersion: networking.k8s.io/v1
-kind: Ingress
+kind: IngressClass
 metadata:
-  name: claude-gateway
-  namespace: claude-gateway
+  name: alb
   annotations:
-    alb.ingress.kubernetes.io/target-type: ip
-    alb.ingress.kubernetes.io/listen-ports: '[{"HTTPS":443}]'
-    alb.ingress.kubernetes.io/certificate-arn: <your-acm-certificate-arn>
-    alb.ingress.kubernetes.io/ssl-policy: ELBSecurityPolicy-TLS13-1-2-2021-06
-    alb.ingress.kubernetes.io/healthcheck-path: /readyz
-    alb.ingress.kubernetes.io/target-group-attributes: deregistration_delay.timeout_seconds=30
-    alb.ingress.kubernetes.io/load-balancer-attributes: idle_timeout.timeout_seconds=3600
-    alb.ingress.kubernetes.io/scheme: internal   # internal-only ALB (no public IP)
-    alb.ingress.kubernetes.io/subnets: <subnet-1-id>,<subnet-2-id>
+    ingressclass.kubernetes.io/is-default-class: "true"
 spec:
-  ingressClassName: alb
-  rules:
-    - host: claude-gateway.internal.example.com
-      http:
-        paths:
-          - path: /
-            pathType: Prefix
-            backend:
-              service:
-                name: claude-gateway
-                port:
-                  number: 8080
+  controller: eks.amazonaws.com/alb
+EOF
+
+# SecretProviderClasses (secret names already match the claude-gateway-tf/* prefix
+# if you kept the default name_prefix; otherwise edit k8s/secret-provider-class.yaml):
+kubectl apply -f k8s/secret-provider-class.yaml
 ```
+
+Deploy the workload and internal ALB Ingress. These are templated —
+render them with your values via `deploy.sh` (see [README-OTEL.md](./README-OTEL.md#step-3-deploy-the-collector)
+for the `envsubst`/`deploy.env` pattern):
 
 ```bash
-kubectl apply -f ingress.yaml
+cp deploy.env.example deploy.env
+$EDITOR deploy.env      # AWS_ACCOUNT_ID, AWS_REGION, OTEL_HOST(=gateway host),
+                        # ACM_CERT_ARN, ALB_SUBNETS(=private subnets),
+                        # ALB_PRIVATE_IP, GATEWAY_IMAGE_TAG
+./deploy.sh --dry-run   # validate the rendered manifests
+./deploy.sh             # apply Deployment + Ingress
 ```
 
-> **Important:** Set `idle_timeout.timeout_seconds=3600` on the ALB to prevent long streaming responses from being cut off. The default 60-second timeout will terminate active SSE streams.
+> **AWS Load Balancer Controller:** EKS Auto Mode includes the controller — once
+> the `alb` IngressClass above exists, the internal ALB is created directly from
+> the Ingress, no separate `helm install` needed.
 
-### Step 7: Push the gateway URL to developer machines
+## Step 5 — Verify
 
-The gateway is now running. Set `forceLoginMethod` and `forceLoginGatewayUrl` in the [managed settings file](https://code.claude.com/docs/en/claude-apps-gateway#set-the-gateway-url) you deploy to each device via MDM. There is no gateway option in the login picker for a developer to select manually.
+```bash
+kubectl rollout status deploy/claude-gateway -n claude-gateway --timeout=180s
+kubectl logs -n claude-gateway -l app=claude-gateway -c gateway --tail=20
+# Expect: "claude gateway listening on http://0.0.0.0:8080"
 
-> **Reminder:** The gateway URL must resolve only to private addresses, or Claude Code rejects it at `/login` — see the note at the top of this guide.
+# ALB provisioned + target healthy:
+ALB=$(kubectl get ingress claude-gateway -n claude-gateway \
+  -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
+echo "$ALB"
+```
 
-### Step 8 (optional): Add usage telemetry
+> **⚠️ The gateway URL must resolve to a private address.** The gateway is
+> fronted by an **internal** ALB. At `/login`, Claude Code requires the gateway's
+> hostname or IP to resolve **only** to private addresses: RFC 1918 (`10/8`,
+> `172.16/12`, `192.168/16`), CGNAT (`100.64.0.0/10`), IPv6 ULA (`fc00::/7`), or
+> loopback. The check runs on *each* resolved IP — if the name resolves to **any**
+> public address, `/login` rejects the URL.
+>
+> If developer machines route HTTPS through a corporate proxy, sign-in also
+> requires the **proxy host** to resolve to private addresses. If it doesn't, add
+> the gateway host to `NO_PROXY` so the CLI connects directly.
 
-To capture per-user token usage in CloudWatch, deploy the OpenTelemetry
-collector described in **[README-OTEL.md](./README-OTEL.md)**. Clients send OTLP
-directly to a standalone collector behind an internal ALB; the gateway pushes
-the client `OTEL_*` configuration via a managed policy.
+Point your gateway hostname at the ALB's **private** IP (private Route 53 alias
+or `/etc/hosts`), then browse `https://<gateway-host>/` — the OIDC login should
+start.
 
-## Troubleshooting
+## Step 6 (optional) — Usage telemetry
 
-| Symptom | Cause | Fix |
-|---|---|---|
-| Pod fails to start with `AccessDenied` calling Bedrock | IRSA not configured correctly; pod not using annotated service account | Verify the SA annotation matches the IAM role ARN, the trust policy references the correct OIDC provider and namespace/SA, and the EKS OIDC provider is registered in IAM |
-| Gateway boot exits with a Postgres connection-timeout error | Security group doesn't allow ingress from EKS pods on port 5432, or RDS is not in the same VPC | Ensure the RDS security group allows TCP 5432 from the EKS pod security group or node CIDR |
-| ALB returns 502 Bad Gateway | Target group health check failing; gateway not ready | Check the health check path is `/readyz`, and the target group port matches 8080 |
-| Streaming responses cut off after 60 seconds | ALB idle timeout is at the default 60s | Set `idle_timeout.timeout_seconds=3600` on the ALB via the Ingress annotation |
-| OIDC callback fails with redirect_uri mismatch | The `public_url` in gateway.yaml doesn't match the registered redirect URI in your IdP | Ensure `listen.public_url` matches the ALB hostname and the IdP's redirect URI is `<public_url>/oauth/callback` |
-| Pod can't pull image from ECR | Node/pod IAM role missing ECR permissions | Attach `AmazonEC2ContainerRegistryReadOnly` to the node instance role or create an ECR pull-through cache |
-| Secrets not mounting in pod | Secrets Store CSI driver or AWS provider not installed; SecretProviderClass references wrong secret names | Verify the CSI driver pods are running, and the gateway service account's IAM role has `secretsmanager:GetSecretValue` permission |
+Follow [README-OTEL.md](./README-OTEL.md) to add per-user token metrics in
+CloudWatch.
 
-## Next steps
+## Tear down
 
-* [Configuration reference](https://code.claude.com/docs/en/claude-apps-gateway-config): every `gateway.yaml` option, including `managed.policies` and `telemetry`
-* [Deployment and operations](https://code.claude.com/docs/en/claude-apps-gateway-deploy): IdP setup, health checks, JWT secret rotation, upgrades, and the security model
-* [Claude apps gateway overview](https://code.claude.com/docs/en/claude-apps-gateway): quickstart and connecting developers
+```bash
+# Remove the k8s workload first (deletes the ALB):
+kubectl delete -f k8s/ingress.yaml -f k8s/deployment.yaml --ignore-not-found
+# Then the infrastructure:
+cd terraform/gateway && terraform destroy
+```
+
+`terraform destroy` removes only Terraform-created resources — **the VPC and its
+subnets are referenced read-only and are never deleted.**
+
+> RDS uses `skip_final_snapshot = true` and secrets use
+> `recovery_window_in_days = 0`, so destroy is clean and immediate — suited to a
+> test stack. For production, take a final snapshot and add a secret recovery
+> window.
