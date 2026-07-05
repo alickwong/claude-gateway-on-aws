@@ -124,6 +124,16 @@ models:
     label: Claude Sonnet 4.6 (global)
     upstream_model:
       bedrock: au.anthropic.claude-sonnet-4-6
+  # Sonnet 5 is only offered via the global CRIS (no au.* profile exists), so
+  # both aliases map to the global inference profile.
+  - id: claude-sonnet-5
+    label: Claude Sonnet 5
+    upstream_model:
+      bedrock: global.anthropic.claude-sonnet-5
+  - id: global.anthropic.claude-sonnet-5
+    label: Claude Sonnet 5 (global)
+    upstream_model:
+      bedrock: global.anthropic.claude-sonnet-5
   - id: claude-haiku-4-5
     label: Claude Haiku 4.5
     upstream_model:
