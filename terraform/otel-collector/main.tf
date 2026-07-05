@@ -188,7 +188,7 @@ resource "aws_cloudwatch_dashboard" "claude_code_usage" {
         type   = "metric"
         x      = 12
         y      = 0
-        width  = 12
+        width  = 6
         height = 6
         properties = {
           metrics = [[{
@@ -206,6 +206,54 @@ resource "aws_cloudwatch_dashboard" "claude_code_usage" {
           title   = "Cost Per User (1 hour, sum)"
           legend  = { position = "bottom" }
           yAxis   = { left = { showUnits = true, label = "USD" } }
+        }
+      },
+      {
+        type   = "metric"
+        x      = 12
+        y      = 6
+        width  = 6
+        height = 6
+        properties = {
+          metrics = [[{
+            expression = "SEARCH('{ClaudeCode,user.email} MetricName=claude_code.cost.usage', 'Sum', 86400)"
+            id         = "e3"
+            period     = 86400
+            region     = var.region
+            label      = "$${PROP('Dim.user.email')}"
+          }]]
+          view    = "timeSeries"
+          stacked = false
+          region  = var.region
+          stat    = "Sum"
+          period  = 86400
+          title   = "Cost Per User (1 Day, sum)"
+          legend  = { position = "bottom" }
+          yAxis   = { left = { showUnits = true, label = "USD" } }
+        }
+      },
+      {
+        type   = "metric"
+        x      = 0
+        y      = 6
+        width  = 12
+        height = 6
+        properties = {
+          metrics = [[{
+            expression = "SEARCH('{ClaudeCode,model} MetricName=claude_code.token.usage', 'Sum', 86400)"
+            id         = "e4"
+            period     = 86400
+            region     = var.region
+            label      = "$${PROP('Dim.model')}"
+          }]]
+          view    = "timeSeries"
+          stacked = false
+          region  = var.region
+          stat    = "Sum"
+          period  = 86400
+          title   = "Token Usage Per Model (1 Day, sum)"
+          legend  = { position = "bottom" }
+          yAxis   = { left = { showUnits = true } }
         }
       },
     ]
